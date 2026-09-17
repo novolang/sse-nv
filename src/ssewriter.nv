@@ -1,0 +1,164 @@
+// ssewriter.nv — a server's side: an event turned back into the lines a
+// stream is made of.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// ENCODING IS NOT THE INVERSE OF PARSING, AND THE DIFFERENCE IS THE
+// NEWLINE
+//
+// A `data` field's value may not contain a newline, because a newline
+// is what ends the line.  So an event whose data is three lines is
+// encoded as THREE `data` fields, and the decoder joins them back
+// together — which is why `encode` takes the data as one string with
+// newlines in it and writes the lines itself.  A server that wrote
+// `data: ${text}` with a text holding a newline has sent a block whose
+// second line is whatever came after it, and a value that happened to
+// start with `event:` has just changed the event's type.
+//
+// The other half of the same rule is the carriage return: the
+// specification's line terminators include a bare carriage return, so a
+// data value holding one is split there too.  `encode` splits on all
+// three terminators and writes a `data` field per piece.
+//
+// NOTHING HERE FAILS EITHER
+//
+// Every event is encodable.  An id holding a NULL is the one value the
+// specification would ignore on the way back in, and `encode` omits the
+// `id` field rather than writing one that will be ignored —
+// `sseevent.id_is_usable` is how a caller checks before it gets there.
+
+use sseevent
+
+// One event as the block a server writes, terminated by the blank line
+// that dispatches it.
+//
+// The data is split on every line terminator and written as one `data`
+// field per line, which is the only correct encoding for multi-line
+// data.  An `event` field is written only when the type is not
+// `"message"`, and an `id` field only when the id is non-empty and
+// usable — which is what every reference server does, and what keeps a
+// stream of ordinary messages down to two lines each.
+//
+// ```novo
+// use sseevent
+// use ssewriter
+//
+// fn main() [io]
+//     println(ssewriter.encode(sseevent.message("hello")))
+// ```
+pub fn encode(e: sseevent.SseEvent) -> Str []
+    todo("sse-nv.ssewriter.encode")
+
+// Several events, one after another.
+//
+// ```novo
+// use sseevent
+// use ssewriter
+//
+// fn main() [io]
+//     println(ssewriter.encode_all([sseevent.message("a"),
+//                                   sseevent.message("b")]))
+// ```
+pub fn encode_all(events: [sseevent.SseEvent]) -> Str []
+    todo("sse-nv.ssewriter.encode_all")
+
+// A `data`-only block, which dispatches an event of the default type.
+//
+// The shortest thing a server can send that a browser's `EventSource`
+// delivers: two lines and a blank one.
+//
+// ```novo
+// use ssewriter
+//
+// fn main() [io]
+//     println(ssewriter.data("hello"))
+// ```
+pub fn data(text: Str) -> Str []
+    todo("sse-nv.ssewriter.data")
+
+// A comment line.
+//
+// A colon, the text, and a terminator.  The parser ignores it, which is
+// exactly what makes it useful: a comment sent every few seconds keeps
+// a proxy from closing an idle connection, and costs the client
+// nothing.
+//
+// A comment's text may not contain a newline; one that does is written
+// as several comment lines, so the result is still ignorable.
+//
+// ```novo
+// use ssewriter
+//
+// fn main() [io]
+//     println(ssewriter.comment("ping"))                    // :ping
+// ```
+pub fn comment(text: Str) -> Str []
+    todo("sse-nv.ssewriter.comment")
+
+// The keep-alive a server sends to hold a connection open: a comment
+// with no text.
+//
+// One colon and a terminator, which is the smallest thing that passes
+// through a proxy's idle timer.  Named rather than left to each server
+// to invent, because a server that invented a `data:` heartbeat instead
+// delivers an empty event to every client.
+//
+// ```novo
+// use ssewriter
+//
+// fn main() [io]
+//     println("${str.len(ssewriter.keep_alive())}")
+// ```
+pub fn keep_alive() -> Str []
+    todo("sse-nv.ssewriter.keep_alive")
+
+// A `retry` line, setting the client's reconnection time in
+// milliseconds.
+//
+// A negative value is written as zero rather than refused, because the
+// specification's parser would ignore the minus sign's line entirely
+// and leave the client on whatever time it had — which is a server
+// asking for a delay and silently not getting one.
+//
+// ```novo
+// use ssewriter
+//
+// fn main() [io]
+//     println(ssewriter.retry(5000))                        // retry: 5000
+// ```
+pub fn retry(millis: Int) -> Str []
+    todo("sse-nv.ssewriter.retry")
+
+// An `id` line on its own, updating the client's last event id without
+// dispatching an event.
+//
+// A block of nothing but an `id` line dispatches NOTHING, because the
+// data buffer is empty — so this is how a server moves a client's
+// resumption point past events it does not need to replay.  It is also
+// the shape that breaks a decoder which fires an empty event for a
+// data-less block.
+//
+// ```novo
+// use ssewriter
+//
+// fn main() [io]
+//     println(ssewriter.id_only("42"))
+// ```
+pub fn id_only(id: Str) -> Str []
+    todo("sse-nv.ssewriter.id_only")
+
+// The `Content-Type` header value a server must send.
+//
+// `text/event-stream`.  A response with any other media type is not an
+// event stream, and the specification requires a client to fail the
+// connection permanently rather than reconnect — so a server that got
+// this wrong is not retried and never finds out.
+//
+// ```novo
+// use ssewriter
+//
+// fn main() [io]
+//     println(ssewriter.content_type())                     // text/event-stream
+// ```
+pub fn content_type() -> Str []
+    todo("sse-nv.ssewriter.content_type")

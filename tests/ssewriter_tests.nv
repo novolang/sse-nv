@@ -1,0 +1,197 @@
+// ssewriter_tests.nv — the API suite for the encoder and for the
+// reconnection rules.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: sse-nv.<module>.<fn>`.
+//
+// THE ENCODER's ONE HARD CASE IS THE NEWLINE.  A `data` value may not
+// contain one, because a newline is what ends the line — so an event
+// whose data is three lines is three `data` fields, and a server that
+// wrote one field with the newlines still in it sent a block whose
+// second line is whatever came after.  The round-trip tests below are
+// what catch that.
+
+use std.test
+use std.str
+use sseevent
+use ssereader
+use ssewriter
+use ssereconnect
+
+// Feed a block to a fresh reader and answer the event it dispatched.
+fn dispatched(text: Str) -> ?sseevent.SseEvent
+    let step = ssereader.feed_text(ssereader.reader(ssereader.default_limits()), text)
+    match step.signal
+        Some(SseDispatch(e)) => Some(e)
+        _                    => None
+
+@test
+fn test_the_ordinary_event_is_two_lines_and_a_blank_one() [io]
+    test.case("a default-typed event with no id writes no event or id field")
+    let out = ssewriter.encode(sseevent.message("hello"))
+    test.assert(str.contains(out, "data: hello"))
+    test.assert(not str.contains(out, "event:"))
+    test.assert(not str.contains(out, "id:"))
+
+    test.case("and it ends with the blank line that dispatches it")
+    test.assert(str.ends_with(out, "\n\n"))
+
+    test.case("a non-default type writes an event field")
+    test.assert(str.contains(ssewriter.encode(sseevent.event("update", "x")),
+                             "event: update"))
+
+    test.case("and a usable id writes an id field")
+    let with_id = ssewriter.encode(sseevent.with_id(sseevent.message("x"), "42"))
+    test.assert(str.contains(with_id, "id: 42"))
+
+@test
+fn test_multi_line_data_is_one_field_per_line() [io]
+    // The rule that makes encoding not the inverse of parsing.
+    test.case("three lines of data are three data fields")
+    let out = ssewriter.encode(sseevent.message("a\nb\nc"))
+    test.assert(str.count(out, "data: ") == 3)
+
+    test.case("and no data line carries an embedded newline")
+    test.assert(not str.contains(out, "data: a\nb"))
+
+@test
+fn test_an_encoded_event_decodes_back_to_itself() [io]
+    test.case("a plain message")
+    match dispatched(ssewriter.encode(sseevent.message("hello")))
+        None    => test.fail("this package's own output decodes")
+        Some(e) =>
+            test.assert(e.data == "hello")
+            test.assert(e.kind == "message")
+
+    test.case("multi-line data survives the round trip")
+    match dispatched(ssewriter.encode(sseevent.message("a\nb\nc")))
+        None    => test.fail("this package's own output decodes")
+        Some(e) => test.assert(e.data == "a\nb\nc")
+
+    test.case("and so does a type and an id")
+    match dispatched(ssewriter.encode(
+              sseevent.with_id(sseevent.event("update", "x"), "42")))
+        None    => test.fail("this package's own output decodes")
+        Some(e) =>
+            test.assert(e.kind == "update")
+            test.assert(e.id == "42")
+
+    test.case("a data value that looks like a field name is still data")
+    // Written as one `data` field, so the decoder reads it as a value
+    // and not as an `event` line.
+    match dispatched(ssewriter.encode(sseevent.message("event: gotcha")))
+        None    => test.fail("this package's own output decodes")
+        Some(e) =>
+            test.assert(e.data == "event: gotcha")
+            test.assert(e.kind == "message")
+
+@test
+fn test_an_id_line_alone_moves_the_resumption_point_and_fires_nothing() [io]
+    test.case("the encoded block has an id and no data")
+    let out = ssewriter.id_only("42")
+    test.assert(str.contains(out, "id: 42"))
+    test.assert(not str.contains(out, "data:"))
+
+    test.case("so it dispatches no event")
+    match dispatched(out)
+        Some(_) => test.fail("an empty data buffer dispatches nothing")
+        None    => test.assert(true)
+
+@test
+fn test_a_comment_is_a_colon_and_is_ignored_by_the_parser() [io]
+    test.case("a comment line starts with a colon")
+    test.assert(str.starts_with(ssewriter.comment("ping"), ":"))
+
+    test.case("the keep-alive is the smallest thing a server can send")
+    test.assert(str.starts_with(ssewriter.keep_alive(), ":"))
+
+    test.case("and neither dispatches an event")
+    match dispatched(ssewriter.comment("ping"))
+        Some(_) => test.fail("a comment is not an event")
+        None    => test.assert(true)
+
+@test
+fn test_the_retry_line_and_the_media_type() [io]
+    test.case("a retry line carries the milliseconds")
+    test.assert(str.contains(ssewriter.retry(5000), "5000"))
+
+    test.case("a negative time is written as zero, not dropped")
+    // A dropped line would leave the client on whatever time it had,
+    // which is a server asking for a delay and not getting one.
+    test.assert(str.contains(ssewriter.retry(-1), "0"))
+    test.assert(not str.contains(ssewriter.retry(-1), "-"))
+
+    test.case("the media type is the specification's")
+    test.assert(ssewriter.content_type() == "text/event-stream")
+
+@test
+fn test_the_two_permanent_stops_are_the_only_ones() [io]
+    test.case("204 No Content means stop for good")
+    match ssereconnect.after_close(204, "text/event-stream", 3000)
+        SseStopPermanently(_) => test.assert(true)
+        SseReconnectAfter(_)  => test.fail("204 is not retried")
+
+    test.case("and so does a media type that is not text/event-stream")
+    match ssereconnect.after_close(200, "text/plain", 3000)
+        SseStopPermanently(_) => test.assert(true)
+        SseReconnectAfter(_)  => test.fail("that is not an event stream")
+
+    test.case("a 500 is retried, because the server may be restarting")
+    match ssereconnect.after_close(500, "text/event-stream", 3000)
+        SseReconnectAfter(ms) => test.assert(ms == 3000)
+        SseStopPermanently(_) => test.fail("500 is retried")
+
+    test.case("and so is a 503, which a client must not invent a rule for")
+    test.assert(not ssereconnect.is_permanent_status(503))
+    test.assert(not ssereconnect.is_permanent_status(404))
+    test.assert(ssereconnect.is_permanent_status(204))
+
+@test
+fn test_the_media_type_match_ignores_parameters_and_case() [io]
+    test.case("parameters do not change the media type")
+    test.assert(ssereconnect.is_event_stream("text/event-stream; charset=utf-8"))
+
+    test.case("nor does case")
+    test.assert(ssereconnect.is_event_stream("TEXT/EVENT-STREAM"))
+
+    test.case("an absent header is not an event stream")
+    test.assert(not ssereconnect.is_event_stream(""))
+    test.assert(not ssereconnect.is_event_stream("application/json"))
+
+@test
+fn test_the_last_event_id_header() [io]
+    test.case("no id means no header, which is not an empty one")
+    match ssereconnect.last_event_id_header("")
+        Some(_) => test.fail("an absent header and an empty one differ")
+        None    => test.assert(true)
+
+    test.case("an id means the header carries it unchanged")
+    match ssereconnect.last_event_id_header("42")
+        None    => test.fail("there is an id to send")
+        Some(v) => test.assert(v == "42")
+
+    test.case("and the name is spelled the specification's way")
+    test.assert(ssereconnect.last_event_id_header_name() == "Last-Event-ID")
+
+@test
+fn test_the_default_reconnection_time() [io]
+    test.case("three seconds, until a retry field changes it")
+    test.assert(ssereconnect.default_retry_millis() == 3000)
+
+@test
+fn test_several_events_encode_one_after_another() [io]
+    test.case("two events make two blocks")
+    let out = ssewriter.encode_all([sseevent.message("a"), sseevent.message("b")])
+    test.assert(str.count(out, "data: ") == 2)
+
+    test.case("and the data-only helper is the shortest block there is")
+    test.assert(str.contains(ssewriter.data("hello"), "data: hello"))
+
+@test
+fn test_an_event_is_what_its_three_parts_say() [io]
+    test.case("the default type is message")
+    test.assert(sseevent.is_message(sseevent.message("x")))
+    test.assert(not sseevent.is_message(sseevent.event("update", "x")))
+
+    test.case("empty data is no lines, not one empty line")
+    test.assert(str.len(sseevent.message("").data) == 0)

@@ -1,0 +1,304 @@
+// ssereader.nv — the stream parser, as a reader that is fed bytes and
+// drained of what they meant.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE READER IS THE SPECIFICATION's FOUR BUFFERS
+//
+// The WHATWG stream parser holds four things between lines: a data
+// buffer, an event type buffer, a last event id buffer and a
+// reconnection time.  The first two are reset on every dispatch and the
+// last two are NOT — which is the whole of the resumption mechanism,
+// and the reason this is a reader rather than a function over a string.
+//
+// FEED AND DRAIN, BECAUSE THIS IS `core`
+//
+// This package reads no socket.  The host reads bytes however it likes
+// and hands them here; `feed` takes bytes and produces at most one
+// signal, and `take` produces the next one already buffered.  A read of
+// 8 KiB holding forty events gives one from `feed` and thirty-nine from
+// `take`, and a caller loops until `take` answers `None`.
+//
+// NOTHING HERE FAILS
+//
+// There is no `Result` in this module and no error type in this
+// package.  The specification's parser ignores what it does not
+// understand, at every level: an unknown field, a malformed `retry`, an
+// `id` holding a NULL, a line with no colon.  A decoder that refused
+// any of them would disconnect from a server that is behaving exactly
+// as specified.
+//
+// The one thing that is not in the specification is a SIZE LIMIT, and
+// it is not an error either.  An event stream is unbounded by design
+// and a caller cannot buffer without a bound, so a block that grows
+// past `max_event_bytes` is DROPPED and reported as `SseOverflow`.  The
+// stream carries on at the next blank line, which is the only behaviour
+// that keeps a long-running client alive against a server having a bad
+// day.
+
+use sseevent
+
+// What a reader refuses to grow past.
+//
+// ```novo
+// use ssereader
+//
+// fn main() [io]
+//     println("${ssereader.default_limits().max_event_bytes}")
+// ```
+pub struct SseLimits
+    // Bytes one block's accumulated data may reach before the block is
+    // dropped and `SseOverflow` reported.  It bounds one event, not the
+    // stream: a stream of any length passes through in events this big.
+    max_event_bytes: Int
+    // Bytes one line may reach before the reader stops accumulating it.
+    // A server that never sends a terminator is otherwise a memory leak
+    // that costs the attacker one connection.
+    max_line_bytes: Int
+
+// One thing that came out of a reader.
+//
+// ```novo
+// use ssereader
+//
+// fn main() [io]
+//     println("${ssereader.default_limits().max_line_bytes}")
+// ```
+pub enum SseSignal
+    // A block ended and had data, so an event was dispatched.
+    SseDispatch(event: sseevent.SseEvent)
+    // A `retry` field set the reconnection time, in milliseconds.  The
+    // reader keeps it — `retry_millis` reads it back — and reports it
+    // so a caller that persists the value across process restarts can.
+    SseRetry(millis: Int)
+    // A comment line.  The parser ignores it; it is reported because a
+    // comment is how nearly every server keeps a connection alive
+    // through a proxy's idle timeout, and a client watching for a dead
+    // stream is watching for these.
+    SseComment(text: Str)
+    // A block was dropped because it grew past `max_event_bytes`.  Not
+    // a fault: the reader resynchronises at the next blank line and the
+    // stream continues.
+    SseOverflow(bytes_dropped: Int)
+
+// The parser's state between "some bytes turned up" and "here is a
+// signal".
+//
+// Opaque: the fields are here because a struct needs them, and a caller
+// that reaches into one has coupled itself to a buffering decision this
+// package intends to change.  `last_event_id`, `retry_millis` and
+// `pending_len` are the facts about a reader that are anybody's
+// business.
+pub struct SseReader
+    limits: SseLimits
+    pending: Str
+    data_buffer: Str
+    type_buffer: Str
+    last_id: Str
+    retry: Int
+
+// A reader and the one signal that came out of it, if one did.
+//
+// A struct rather than a tuple because the two halves are used at
+// different places: the caller reassigns the reader and dispatches on
+// the signal.
+pub struct SseStep
+    reader: SseReader
+    // `None` means "nothing complete in what I have been given yet",
+    // which on a socket is the ordinary case.
+    signal: ?SseSignal
+
+// An event of 1 MiB and a line of 64 KiB.
+//
+// The event figure is what a server streaming a model's output or a
+// large diff actually sends; the line figure is two orders of magnitude
+// more than any field a specified server writes.
+//
+// ```novo
+// use ssereader
+//
+// fn main() [io]
+//     println("${ssereader.default_limits().max_event_bytes}")
+// ```
+pub fn default_limits() -> SseLimits []
+    todo("sse-nv.ssereader.default_limits")
+
+// An event of 4 KiB and a line of 512 bytes.
+//
+// Named rather than left to each constrained caller to invent, because
+// the number that matters on a small device is the one that fits beside
+// everything else in its RAM.
+//
+// ```novo
+// use ssereader
+//
+// fn main() [io]
+//     println("${ssereader.small_limits().max_line_bytes}")
+// ```
+pub fn small_limits() -> SseLimits []
+    todo("sse-nv.ssereader.small_limits")
+
+// A reader holding nothing, with no id and the default reconnection
+// time.
+//
+// ```novo
+// use ssereader
+//
+// fn main() [io]
+//     println(ssereader.last_event_id(ssereader.reader(ssereader.default_limits())))
+// ```
+pub fn reader(limits: SseLimits) -> SseReader []
+    todo("sse-nv.ssereader.reader")
+
+// A reader that resumes: it starts with the last event id a previous
+// connection reached.
+//
+// THE OTHER HALF OF RESUMPTION.  A client that dropped sends the id
+// back as a `Last-Event-ID` header, and the server replays from there.
+// The reader needs the same id, because the events the server replays
+// may not repeat it and the events after them must still carry it.  A
+// client that reconnected with a fresh reader would report `""` as the
+// id of every event until the server sent another one, and would then
+// resume from the beginning after the next drop.
+//
+// ```novo
+// use ssereader
+//
+// fn main() [io]
+//     let r = ssereader.resuming(ssereader.default_limits(), "42")
+//     println(ssereader.last_event_id(r))                   // 42
+// ```
+pub fn resuming(limits: SseLimits, last_event_id: Str) -> SseReader []
+    todo("sse-nv.ssereader.resuming")
+
+// Adds bytes, and takes one signal if the addition produced one.
+//
+// The bytes are the stream's, UTF-8, and a BYTE ORDER MARK at the very
+// start is removed — the specification requires it, and a stream whose
+// first three bytes were kept would have a `data` field named
+// `"﻿data"` and would ignore it.
+//
+// Takes ONE.  A read that produced forty signals leaves thirty-nine
+// inside, and `take` is what gets them.
+//
+// ```novo
+// use std.bytes
+// use ssereader
+//
+// fn main() [io]
+//     let r = ssereader.reader(ssereader.default_limits())
+//     let wire = bytes.to_byte_list(bytes.from_str("data: hi\n\n"))
+//     match ssereader.feed(r, wire).signal
+//         None    => println("partial")
+//         Some(_) => println("a signal")
+// ```
+pub fn feed(r: SseReader, bytes: [u8]) -> SseStep []
+    todo("sse-nv.ssereader.feed")
+
+// Adds text rather than bytes.
+//
+// For a caller whose transport already decoded UTF-8 — a test, a
+// recorded stream read from a file, an in-process producer.  The same
+// parser, and the same reader comes back.
+//
+// ```novo
+// use ssereader
+//
+// fn main() [io]
+//     let r = ssereader.reader(ssereader.default_limits())
+//     match ssereader.feed_text(r, "data: hi\n\n").signal
+//         None    => println("partial")
+//         Some(_) => println("a signal")
+// ```
+pub fn feed_text(r: SseReader, text: Str) -> SseStep []
+    todo("sse-nv.ssereader.feed_text")
+
+// Takes one signal if a complete one is already buffered, adding
+// nothing.
+//
+// `signal` is `None` when the buffer holds an unfinished block, and the
+// reader comes back unchanged.  A caller loops on this until `None` and
+// then goes back to its transport.
+//
+// ```novo
+// use ssereader
+//
+// fn main() [io]
+//     let r = ssereader.reader(ssereader.default_limits())
+//     match ssereader.take(r).signal
+//         Some(_) => println("a signal")
+//         None    => println("nothing buffered")
+// ```
+pub fn take(r: SseReader) -> SseStep []
+    todo("sse-nv.ssereader.take")
+
+// Tells the reader the connection closed, and takes the last signal.
+//
+// THE SPECIFICATION DISPATCHES NOTHING AT A CLOSE.  A block that was
+// still accumulating when the connection dropped is discarded: the
+// stream ended in the middle of an event and the event was never
+// dispatched, so delivering it would deliver an event the server did
+// not finish sending.  This function exists to say so — it answers
+// `None` and a reader whose block buffers are empty — and because a
+// caller needs somewhere to ask what the last event id and retry time
+// ended up as before it reconnects.
+//
+// ```novo
+// use ssereader
+//
+// fn main() [io]
+//     let r = ssereader.reader(ssereader.default_limits())
+//     match ssereader.finish(r).signal
+//         Some(_) => println("this cannot happen")
+//         None    => println("a partial block is discarded")
+// ```
+pub fn finish(r: SseReader) -> SseStep []
+    todo("sse-nv.ssereader.finish")
+
+// The last event id the stream has set, or `""`.
+//
+// What a client sends back as its `Last-Event-ID` header when it
+// reconnects.  It survives every dispatch, which is what makes
+// resumption work at all.
+//
+// ```novo
+// use ssereader
+//
+// fn main() [io]
+//     println(ssereader.last_event_id(ssereader.resuming(
+//         ssereader.default_limits(), "42")))               // 42
+// ```
+pub fn last_event_id(r: SseReader) -> Str []
+    todo("sse-nv.ssereader.last_event_id")
+
+// The reconnection time in milliseconds the stream last set.
+//
+// The default until a `retry` field changes it, and a value a caller
+// should persist across a process restart so a server that asked for a
+// long delay gets one.
+//
+// ```novo
+// use ssereader
+//
+// fn main() [io]
+//     println("${ssereader.retry_millis(ssereader.reader(
+//         ssereader.default_limits()))}")
+// ```
+pub fn retry_millis(r: SseReader) -> Int []
+    todo("sse-nv.ssereader.retry_millis")
+
+// How many bytes of an unfinished line and an unfinished block the
+// reader is holding.
+//
+// A caller watching this grow without a signal coming out is watching a
+// server that is slow, or one that is filling its buffer on purpose.
+//
+// ```novo
+// use ssereader
+//
+// fn main() [io]
+//     println("${ssereader.pending_len(ssereader.reader(
+//         ssereader.default_limits()))}")                   // 0
+// ```
+pub fn pending_len(r: SseReader) -> Int []
+    todo("sse-nv.ssereader.pending_len")

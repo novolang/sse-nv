@@ -1,0 +1,155 @@
+// sseevent.nv — the event a stream dispatches, and the three buffers
+// the specification says it is made of.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// WHAT AN EVENT IS
+//
+// The WHATWG HTML specification's "server-sent events" section defines
+// a stream as lines of text, grouped into blocks by blank lines.  When
+// a blank line arrives, the parser DISPATCHES: it takes what the
+// `event`, `data` and `id` lines of that block accumulated and fires
+// one event with them.
+//
+// So an event has exactly three parts, and they are not symmetrical:
+//
+//   - the TYPE, which the `event` field set, and which is the string
+//     `"message"` when no `event` field appeared;
+//   - the DATA, which is every `data` field's value joined by newlines,
+//     with the trailing newline removed;
+//   - the LAST EVENT ID, which is whatever the `id` field last set — IN
+//     THIS BLOCK OR IN ANY EARLIER ONE.
+//
+// The third is the one that surprises people.  The id buffer is NOT
+// reset between events: a stream that sends an id once and then fifty
+// events without one has fifty events all carrying that id, and a
+// client resuming after a drop asks for the last one it saw.  That is
+// the whole resumption mechanism, and `SseEvent.id` carries it on every
+// event so a caller never has to track it separately.
+//
+// A BLOCK WITH NO DATA DISPATCHES NOTHING
+//
+// The specification is explicit: if the data buffer is empty when a
+// blank line arrives, the parser resets the buffers and fires no event.
+// So a block of nothing but an `id` line updates the id and produces
+// no event, and a keep-alive comment produces no event either.  A
+// decoder that fired an empty event for those would deliver a stream of
+// them to any server that uses a bare `id` line as its heartbeat.
+
+// One dispatched event.
+//
+// ```novo
+// use sseevent
+//
+// fn main() [io]
+//     println(sseevent.event("update", "{\"n\":1}").kind)   // update
+// ```
+pub struct SseEvent
+    // The event type: the `event` field's value, or `"message"` when
+    // the block had no `event` field.  Never empty — a block with
+    // `event:` and nothing after it sets the type to the empty string,
+    // and the specification then leaves it as the empty string, which
+    // `is_message` reports as false.
+    kind: Str
+    // The data, with the newlines that joined its lines and without a
+    // trailing one.  Text, not JSON: this package does not parse it,
+    // because most streams send JSON and some send a plain sentence,
+    // and a decoder that assumed the first breaks the second.
+    data: Str
+    // The last event id in force when this event was dispatched: set
+    // by an `id` field in this block or in any earlier one, and `""`
+    // when no `id` field has ever appeared.  A client that drops sends
+    // this back as its `Last-Event-ID` request header.
+    id: Str
+
+// An event with a type and data, and no id.
+//
+// ```novo
+// use sseevent
+//
+// fn main() [io]
+//     println(sseevent.event("message", "hello").data)      // hello
+// ```
+pub fn event(kind: Str, data: Str) -> SseEvent []
+    todo("sse-nv.sseevent.event")
+
+// An event of the default type `"message"`.
+//
+// The type a block with no `event` field gets, which is the common
+// case: a server sending one kind of thing sends no `event` fields at
+// all.
+//
+// ```novo
+// use sseevent
+//
+// fn main() [io]
+//     println(sseevent.message("hello").kind)               // message
+// ```
+pub fn message(data: Str) -> SseEvent []
+    todo("sse-nv.sseevent.message")
+
+// The same event with an id attached.
+//
+// ```novo
+// use sseevent
+//
+// fn main() [io]
+//     println(sseevent.with_id(sseevent.message("hi"), "42").id)   // 42
+// ```
+pub fn with_id(e: SseEvent, id: Str) -> SseEvent []
+    todo("sse-nv.sseevent.with_id")
+
+// Whether the event is of the default type.
+//
+// True when `kind` is exactly `"message"`.  A caller dispatching on the
+// type asks this first, because a stream that sends no `event` fields
+// sends nothing else.
+//
+// ```novo
+// use sseevent
+//
+// fn main() [io]
+//     println("${sseevent.is_message(sseevent.message("hi"))}")     // true
+// ```
+pub fn is_message(e: SseEvent) -> Bool []
+    todo("sse-nv.sseevent.is_message")
+
+// The data split back into the lines the stream sent it as.
+//
+// The decoder joins a block's `data` fields with newlines, which is
+// what the specification says to do and what almost every consumer
+// wants.  A consumer that wanted the lines — a stream sending one JSON
+// document per line inside one event — gets them back here rather than
+// splitting the string itself and getting the empty-data case wrong.
+//
+// An event with empty data answers an empty list, not a list holding
+// one empty string.
+//
+// ```novo
+// use std.list
+// use sseevent
+//
+// fn main() [io]
+//     println("${list.len(sseevent.data_lines(sseevent.message("a\nb")))}")   // 2
+// ```
+pub fn data_lines(e: SseEvent) -> [Str] []
+    todo("sse-nv.sseevent.data_lines")
+
+// Whether an id may be used as the last event id.
+//
+// The specification ignores an `id` field whose value contains a NULL
+// character, and keeps the previous id instead.  A server that emitted
+// one would otherwise put a value in a `Last-Event-ID` header that
+// cannot be sent.  A caller building events to encode checks this
+// before it calls `with_id`; the decoder applies the same rule on the
+// way in.
+//
+// ```novo
+// use sseevent
+//
+// fn main() [io]
+//     println("${sseevent.id_is_usable("42")}")             // true
+//     println("${sseevent.id_is_usable("")}")               // true
+// ```
+pub fn id_is_usable(id: Str) -> Bool []
+    todo("sse-nv.sseevent.id_is_usable")

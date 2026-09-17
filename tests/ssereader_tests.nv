@@ -1,0 +1,288 @@
+// ssereader_tests.nv — the API suite for the line grammar and the
+// stream parser.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: sse-nv.<module>.<fn>`.
+//
+// THE CASES ARE THE ONES THE SPECIFICATION SPELLS OUT AND
+// IMPLEMENTATIONS STILL GET WRONG: exactly one leading space removed
+// from a field value, a bare carriage return as a line terminator, a
+// block with no data dispatching nothing, and an id buffer that
+// survives a dispatch.  Each is named with the rule it comes from.
+
+use std.test
+use std.list
+use std.str
+use std.bytes
+use sseevent
+use ssewire
+use ssereader
+
+// Text as the byte list a reader is fed.
+fn u8s(text: Str) -> [u8]
+    bytes.to_byte_list(bytes.from_str(text))
+
+// A reader with the default limits.
+fn fresh() -> ssereader.SseReader
+    ssereader.reader(ssereader.default_limits())
+
+@test
+fn test_exactly_one_leading_space_is_removed_from_a_value() [io]
+    test.case("a space after the colon is not part of the value")
+    match ssewire.parse_line("data: hello")
+        SseFieldLine(_, v) => test.assert(v == "hello")
+        _                  => test.fail("that is a field line")
+
+    test.case("no space is the same value")
+    match ssewire.parse_line("data:hello")
+        SseFieldLine(_, v) => test.assert(v == "hello")
+        _                  => test.fail("that is a field line")
+
+    test.case("two spaces leave one, because exactly one is removed")
+    match ssewire.parse_line("data:  hello")
+        SseFieldLine(_, v) => test.assert(v == " hello")
+        _                  => test.fail("that is a field line")
+
+@test
+fn test_the_four_line_shapes() [io]
+    test.case("an empty line dispatches")
+    match ssewire.parse_line("")
+        SseDispatchLine => test.assert(true)
+        _               => test.fail("an empty line is a dispatch")
+
+    test.case("a leading colon is a comment, and the colon is not in the text")
+    match ssewire.parse_line(":ping")
+        SseCommentLine(t) => test.assert(t == "ping")
+        _                 => test.fail("that is a comment")
+
+    test.case("a comment's one leading space goes too")
+    match ssewire.parse_line(": ping")
+        SseCommentLine(t) => test.assert(t == "ping")
+        _                 => test.fail("that is a comment")
+
+    test.case("a line with no colon is a field with an empty value")
+    match ssewire.parse_line("data")
+        SseFieldLine(f, v) =>
+            test.assert(v == "")
+            test.assert(ssewire.field_name(f) == "data")
+        _                  => test.fail("that is a field line")
+
+@test
+fn test_an_unknown_field_keeps_its_name_and_is_not_defined() [io]
+    test.case("field names are case-sensitive, so Event is not event")
+    match ssewire.field_of("Event")
+        SseFieldOther(n) => test.assert(n == "Event")
+        _                => test.fail("Event is not a defined field")
+
+    test.case("and the four defined ones are")
+    test.assert(ssewire.is_defined_field(ssewire.field_of("event")))
+    test.assert(ssewire.is_defined_field(ssewire.field_of("data")))
+    test.assert(ssewire.is_defined_field(ssewire.field_of("id")))
+    test.assert(ssewire.is_defined_field(ssewire.field_of("retry")))
+    test.assert(not ssewire.is_defined_field(ssewire.field_of("comment")))
+
+@test
+fn test_all_three_line_terminators_end_a_line() [io]
+    test.case("a line feed")
+    test.assert(list.len(ssewire.split_lines("a\nb\n").lines) == 2)
+
+    test.case("a carriage return and line feed pair is ONE terminator")
+    // A parser that split on each character sees a blank line between
+    // every pair and dispatches a block on each.
+    test.assert(list.len(ssewire.split_lines("a\r\nb\r\n").lines) == 2)
+
+    test.case("and a bare carriage return, which implementations forget")
+    test.assert(list.len(ssewire.split_lines("a\rb\r").lines) == 2)
+
+@test
+fn test_an_unterminated_tail_is_held_back() [io]
+    test.case("what follows the last terminator is the remainder")
+    let s = ssewire.split_lines("a\nb\nc")
+    test.assert(list.len(s.lines) == 2)
+    test.assert(s.remainder == "c")
+
+    test.case("text ending on a terminator has no remainder")
+    test.assert(ssewire.split_lines("a\n").remainder == "")
+
+    test.case("a lone trailing carriage return is held back, not consumed")
+    // The next byte may be the line feed that belongs to it, and
+    // consuming it would make one terminator into two.
+    let t = ssewire.split_lines("a\r")
+    test.assert(t.remainder == "\r")
+
+@test
+fn test_a_retry_value_is_digits_or_it_is_ignored() [io]
+    test.case("digits are acted on")
+    test.assert(ssewire.is_retry_value("5000"))
+    test.assert(ssewire.is_retry_value("0"))
+
+    test.case("anything else is ignored, and the previous time stands")
+    test.assert(not ssewire.is_retry_value("5s"))
+    test.assert(not ssewire.is_retry_value("-1"))
+    test.assert(not ssewire.is_retry_value("5.0"))
+    test.assert(not ssewire.is_retry_value(""))
+
+@test
+fn test_a_block_with_data_dispatches_one_event() [io]
+    test.case("two lines and a blank one are an event")
+    match ssereader.feed(fresh(), u8s("data: hello\n\n")).signal
+        None    => test.fail("a complete block dispatches")
+        Some(s) =>
+            match s
+                SseDispatch(e) =>
+                    test.assert(e.data == "hello")
+                    test.assert(e.kind == "message")
+                    test.assert(e.id == "")
+                _              => test.fail("a block with data dispatches an event")
+
+@test
+fn test_a_block_with_no_data_dispatches_nothing() [io]
+    // The rule a decoder breaks by firing an empty event: a server that
+    // uses a bare `id` line as its heartbeat would deliver one every
+    // few seconds.
+    test.case("an id line alone updates the id and fires no event")
+    let step = ssereader.feed(fresh(), u8s("id: 42\n\n"))
+    match step.signal
+        Some(SseDispatch(_)) => test.fail("an empty data buffer dispatches nothing")
+        _                    => test.assert(true)
+
+    test.case("but the id took effect")
+    test.assert(ssereader.last_event_id(step.reader) == "42")
+
+@test
+fn test_several_data_lines_are_joined_by_newlines() [io]
+    test.case("three data fields become one event of three lines")
+    match ssereader.feed(fresh(), u8s("data: a\ndata: b\ndata: c\n\n")).signal
+        Some(SseDispatch(e)) =>
+            test.assert(e.data == "a\nb\nc")
+            test.assert(list.len(sseevent.data_lines(e)) == 3)
+        _                    => test.fail("that is one event")
+
+    test.case("and the trailing newline the parser appends is removed")
+    match ssereader.feed(fresh(), u8s("data: a\n\n")).signal
+        Some(SseDispatch(e)) => test.assert(not str.ends_with(e.data, "\n"))
+        _                    => test.fail("that is one event")
+
+@test
+fn test_the_id_survives_a_dispatch_and_the_type_does_not() [io]
+    // The whole of the resumption mechanism: the id buffer is not reset
+    // between events, and the event type buffer is.
+    let r = fresh()
+    test.case("an event with an id and a type")
+    let first = ssereader.feed(r, u8s("event: update\nid: 7\ndata: a\n\n"))
+    match first.signal
+        Some(SseDispatch(e)) =>
+            test.assert(e.kind == "update")
+            test.assert(e.id == "7")
+        _                    => test.fail("that is one event")
+
+    test.case("the next event carries the same id although it sent none")
+    match ssereader.feed(first.reader, u8s("data: b\n\n")).signal
+        Some(SseDispatch(e)) =>
+            test.assert(e.id == "7")
+            test.case("and its type went back to the default")
+            test.assert(e.kind == "message")
+        _                    => test.fail("that is one event")
+
+@test
+fn test_an_id_holding_a_null_is_ignored() [io]
+    test.case("a NULL in an id keeps the previous id")
+    test.assert(not sseevent.id_is_usable("4\u{0}2"))
+    test.assert(sseevent.id_is_usable("42"))
+
+@test
+fn test_a_retry_field_sets_the_reconnection_time_and_reports_it() [io]
+    test.case("a retry line is a signal of its own")
+    let step = ssereader.feed(fresh(), u8s("retry: 5000\n"))
+    match step.signal
+        Some(SseRetry(ms)) => test.assert(ms == 5000)
+        _                  => test.fail("a retry line reports itself")
+
+    test.case("and the reader keeps it")
+    test.assert(ssereader.retry_millis(step.reader) == 5000)
+
+    test.case("a retry that is not digits leaves the time alone")
+    let before = ssereader.retry_millis(fresh())
+    let after = ssereader.feed(fresh(), u8s("retry: 5s\n"))
+    test.assert(ssereader.retry_millis(after.reader) == before)
+
+@test
+fn test_a_comment_is_reported_and_is_not_an_event() [io]
+    // A comment is how nearly every server keeps a connection alive
+    // through a proxy's idle timeout, so a client watching for a dead
+    // stream is watching for these.
+    test.case("a comment line is its own signal")
+    match ssereader.feed(fresh(), u8s(":ping\n")).signal
+        Some(SseComment(t)) => test.assert(t == "ping")
+        _                   => test.fail("a comment reports itself")
+
+@test
+fn test_an_event_fed_in_pieces_is_one_event() [io]
+    // The case a developer never sees on localhost.
+    let r = fresh()
+    test.case("a prefix produces nothing")
+    let a = ssereader.feed(r, u8s("data: he"))
+    match a.signal
+        Some(_) => test.fail("that block has not ended")
+        None    => test.assert(ssereader.pending_len(a.reader) > 0)
+
+    test.case("and the rest completes it")
+    match ssereader.feed(a.reader, u8s("llo\n\n")).signal
+        Some(SseDispatch(e)) => test.assert(e.data == "hello")
+        _                    => test.fail("the block is complete now")
+
+@test
+fn test_feed_takes_one_and_take_gets_the_rest() [io]
+    test.case("two events in one read")
+    let a = ssereader.feed(fresh(), u8s("data: a\n\ndata: b\n\n"))
+    match a.signal
+        Some(SseDispatch(e)) => test.assert(e.data == "a")
+        _                    => test.fail("the first event is complete")
+
+    test.case("and the second comes from take")
+    let b = ssereader.take(a.reader)
+    match b.signal
+        Some(SseDispatch(e)) => test.assert(e.data == "b")
+        _                    => test.fail("the second event is complete")
+
+    test.case("and then there is nothing left")
+    match ssereader.take(b.reader).signal
+        Some(_) => test.fail("only two events were fed")
+        None    => test.assert(true)
+
+@test
+fn test_a_partial_block_is_discarded_at_the_close() [io]
+    // The stream ended in the middle of an event, so the event was
+    // never dispatched.  Delivering it would deliver something the
+    // server did not finish sending.
+    test.case("a block with no blank line after it is dropped")
+    let a = ssereader.feed(fresh(), u8s("data: half"))
+    match ssereader.finish(a.reader).signal
+        Some(_) => test.fail("an unfinished block is not dispatched")
+        None    => test.assert(true)
+
+@test
+fn test_an_oversized_block_is_dropped_and_the_stream_continues() [io]
+    // Not a fault: the specification has no size limit, and a client
+    // that disconnected on one would be killed by a server having a bad
+    // day.
+    let small = ssereader.reader(ssereader.small_limits())
+    test.case("a block over the limit reports an overflow")
+    let big = str.repeat("x", 8192)
+    match ssereader.feed_text(small, "data: ${big}\n\n").signal
+        Some(SseOverflow(n)) => test.assert(n > 0)
+        _                    => test.fail("that block is over the small limit")
+
+@test
+fn test_a_resuming_reader_starts_with_the_id_it_was_given() [io]
+    // A client that reconnected with a fresh reader reports "" as the
+    // id of every event until the server sends another one, and then
+    // resumes from the beginning after the next drop.
+    test.case("the id is in force before any event arrives")
+    let r = ssereader.resuming(ssereader.default_limits(), "42")
+    test.assert(ssereader.last_event_id(r) == "42")
+
+    test.case("and an event that sends no id carries it")
+    match ssereader.feed(r, u8s("data: a\n\n")).signal
+        Some(SseDispatch(e)) => test.assert(e.id == "42")
+        _                    => test.fail("that is one event")

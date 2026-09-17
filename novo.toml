@@ -1,0 +1,39 @@
+[package]
+name        = "sse-nv"
+version     = "0.0.1"
+description = "The WHATWG text/event-stream format both ways: a decoder that is fed bytes and drained of events, encoders for a server writing them, and the reconnection rules as values — the last event id, the retry time, and the two responses that mean stop for good.  No socket.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `core`.  A decoder over bytes the caller read and an encoder into
+# text the caller writes.  Nothing here opens a socket, waits out a
+# reconnection delay or reads a clock: the reconnection time is a
+# NUMBER this package computes and the caller sleeps.  Every public
+# function's effect row is `[]`.
+layer       = "core"
+
+category    = "web"
+
+tags        = ["sse", "server-sent-events", "eventsource", "text-event-stream", "whatwg", "streaming", "sans-io", "web"]
+repository  = "https://github.com/novolang/sse-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.9.0"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "The text/event-stream format, decoded and encoded"
+
+[dependencies]
+# None.  The format is lines of text: there is no JSON in it, no
+# compression and no framing beyond the blank line, so there is nothing
+# to depend on.  An event's `data` is often JSON and this package
+# leaves it as the text it was sent as, so a caller parses it with the
+# JSON decoder it already has.

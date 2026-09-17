@@ -1,0 +1,196 @@
+// ssewire.nv — one line of a stream, and what the specification does
+// with it.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE LINE GRAMMAR IS FOUR RULES AND NO ERRORS
+//
+// The WHATWG specification's stream parser has no failure mode at all.
+// Every line is one of four things, and the fourth is "ignore it":
+//
+//   1. an EMPTY line dispatches the block;
+//   2. a line beginning with a COLON is a comment, and is ignored;
+//   3. a line CONTAINING a colon is a field: the name is what precedes
+//      the first colon, the value is what follows it, and ONE leading
+//      space is removed from the value;
+//   4. a line containing no colon is a field whose name is the whole
+//      line and whose value is the empty string.
+//
+// An unknown field name is ignored.  A `retry` whose value is not
+// entirely ASCII digits is ignored.  An `id` containing a NULL is
+// ignored.  Nothing raises, nothing stops the stream, and this package
+// therefore declares no error type — which is the first thing to know
+// about it, because a caller looking for the `Result` will not find one.
+//
+// THE ONE SPACE, AND WHY IT IS ONE
+//
+// `data: hello` and `data:hello` both carry `hello`, because exactly
+// one leading space is removed.  `data:  hello` carries ` hello`, with
+// one space still on it.  An implementation that trimmed instead of
+// removing one would lose the indentation of any stream that sends
+// pre-formatted text, and an implementation that removed none would put
+// a space in front of every value every ordinary server sends.
+
+// A field name the specification defines, or one it does not.
+//
+// ```novo
+// use ssewire
+//
+// fn main() [io]
+//     println(ssewire.field_name(SseFieldData))             // data
+// ```
+pub enum SseFieldKind
+    // `event` — sets the event type for the block being accumulated.
+    SseFieldEvent
+    // `data` — its value is appended to the data buffer, with a
+    // newline after it.
+    SseFieldData
+    // `id` — sets the last event id, unless the value holds a NULL
+    // character, in which case the specification says to ignore it.
+    SseFieldId
+    // `retry` — sets the reconnection time, when the value is entirely
+    // ASCII digits.
+    SseFieldRetry
+    // Anything else.  The specification says to ignore it, and the
+    // name is carried so a caller can log what a server is sending.
+    SseFieldOther(name: Str)
+
+// What one line of a stream is.
+//
+// ```novo
+// use ssewire
+//
+// fn main() [io]
+//     match ssewire.parse_line("data: hello")
+//         SseDispatchLine => println("blank")
+//         SseCommentLine(_) => println("comment")
+//         SseFieldLine(_, value) => println(value)          // hello
+// ```
+pub enum SseLine
+    // An empty line.  Dispatches the block that has been accumulating.
+    SseDispatchLine
+    // A line beginning with a colon.  Ignored by the parser, and
+    // carried here because a caller watching for a stalled connection
+    // wants to see the keep-alives.
+    SseCommentLine(text: Str)
+    // A field and its value, with one leading space already removed
+    // from the value.
+    SseFieldLine(field: SseFieldKind, value: Str)
+
+// The line, parsed.
+//
+// Total: every string is one of the three arms, and there is no fourth
+// for "malformed" because the specification defines none.
+//
+// The argument is ONE line, with its terminator already removed.
+// `split_lines` is what removes them, and it is a separate function
+// because a stream arrives in pieces and the last piece is usually a
+// line that has not ended yet.
+//
+// ```novo
+// use ssewire
+//
+// fn main() [io]
+//     match ssewire.parse_line(":ping")
+//         SseCommentLine(t) => println(t)                   // ping
+//         _                 => println("not a comment")
+// ```
+pub fn parse_line(line: Str) -> SseLine []
+    todo("sse-nv.ssewire.parse_line")
+
+// The field name as it appears on the wire.
+//
+// ```novo
+// use ssewire
+//
+// fn main() [io]
+//     println(ssewire.field_name(SseFieldRetry))            // retry
+// ```
+pub fn field_name(f: SseFieldKind) -> Str []
+    todo("sse-nv.ssewire.field_name")
+
+// The field a name denotes.
+//
+// A name the specification does not define answers `SseFieldOther`
+// carrying it, rather than an absence: the parser ignores it either
+// way, and a caller debugging a server that sends `Event:` with a
+// capital E wants to see the name it actually sent.  Field names are
+// case-sensitive.
+//
+// ```novo
+// use ssewire
+//
+// fn main() [io]
+//     match ssewire.field_of("Event")
+//         SseFieldOther(n) => println("ignored: ${n}")      // ignored: Event
+//         _                => println("a defined field")
+// ```
+pub fn field_of(name: Str) -> SseFieldKind []
+    todo("sse-nv.ssewire.field_of")
+
+// Whether a field is one the specification defines and the parser acts
+// on.
+//
+// ```novo
+// use ssewire
+//
+// fn main() [io]
+//     println("${ssewire.is_defined_field(ssewire.field_of("data"))}")   // true
+// ```
+pub fn is_defined_field(f: SseFieldKind) -> Bool []
+    todo("sse-nv.ssewire.is_defined_field")
+
+// A stream's text split into complete lines, and whatever is left over.
+//
+// THE THREE TERMINATORS.  The specification accepts a carriage return
+// and line feed pair, a line feed alone, and a CARRIAGE RETURN ALONE —
+// the third is the one implementations forget, and a server written on
+// an older platform sends it.  A CRLF pair is one terminator, so a
+// parser that split on each character separately would see a blank line
+// between every pair and dispatch a block on each.
+//
+// The remainder is the text after the last terminator, which is the
+// line that has not ended yet.  A caller feeding a socket keeps it and
+// prepends it to the next read; `ssereader` does exactly that, and this
+// function is public because the same problem turns up in a caller
+// reading a file of recorded events.
+//
+// A lone trailing carriage return is held back in the remainder rather
+// than treated as a terminator, because the next byte may be a line
+// feed that belongs to it.
+//
+// ```novo
+// use std.list
+// use ssewire
+//
+// fn main() [io]
+//     let s = ssewire.split_lines("a\nb\nc")
+//     println("${list.len(s.lines)} ${s.remainder}")         // 2 c
+// ```
+pub fn split_lines(text: Str) -> SseSplit []
+    todo("sse-nv.ssewire.split_lines")
+
+// Complete lines, and the unterminated tail after them.
+pub struct SseSplit
+    // The lines, with their terminators removed.
+    lines: [Str]
+    // What followed the last terminator: a line that has not ended
+    // yet, or `""` when the text ended on one.
+    remainder: Str
+
+// Whether a `retry` value is one the specification acts on: a
+// non-empty string of ASCII digits and nothing else.
+//
+// `retry: 5000` sets the reconnection time.  `retry: 5s`, `retry: -1`
+// and `retry: 5.0` are ignored and the previous time stands, which is
+// the specification's rule and not a lenience this package added.
+//
+// ```novo
+// use ssewire
+//
+// fn main() [io]
+//     println("${ssewire.is_retry_value("5000")}")           // true
+//     println("${ssewire.is_retry_value("5s")}")             // false
+// ```
+pub fn is_retry_value(value: Str) -> Bool []
+    todo("sse-nv.ssewire.is_retry_value")
