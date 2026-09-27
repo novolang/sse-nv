@@ -5,6 +5,36 @@ All notable changes to sse-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## [0.1.0] — 2026-09-27
+
+The first implementation of the interface published as 0.0.1, with the
+WHATWG section's example streams, fed whole and in pieces, and a
+round trip through the encoder as the test suite.
+
+### Changed
+
+- `ssereconnect.after_close` and `is_permanent_status` treat every
+  status other than 200 as a permanent stop, as section 9.2.2 does ("if
+  res's status is not 200 ... fail the connection").  The interface
+  documented 204 as the only permanent status and retried a 500.  Status
+  0 stands for a network error and is retried.
+- `sseevent.id_is_usable` also refuses an id holding a carriage return
+  or a line feed, which a field cannot carry.
+- An event whose `event` field was empty has type `"message"`, as the
+  dispatch steps say; the interface documented the empty string.
+- `ssewire.split_lines` holds a trailing carriage return back together
+  with the line it ends, so `"a\r"` is no lines and the remainder
+  `"a\r"`.  Two interface tests expected otherwise and were corrected.
+- `ssereader.feed` names its byte-list parameter `chunk`.
+
+### Notes
+
+- The reader acts on a carriage return at once and skips a line feed
+  that follows it in the next read, removes a byte order mark split
+  across reads, and drops a block holding a line longer than
+  `max_line_bytes` without reading that line's terminator as a blank
+  line.
+
 ## [0.0.1] — 2026-09-17
 
 **The interface, published before anyone implements it.** Every public

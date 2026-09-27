@@ -7,12 +7,6 @@ to a client over one long-lived HTTP response. The wire format is
 and it is what a browser's `EventSource` reads. This package decodes and
 encodes that format in novo-lang.
 
-**Status: NOT IMPLEMENTED — interface only.** Every function is
-declared with its full signature, but every body is a `todo()` that
-panics when called. The package is published so its design can be
-reviewed and depended on before it is implemented. Version 0.1.0 will
-be the first working release.
-
 ## What the format is
 
 A stream is UTF-8 text, made of lines. A line ends with a carriage
@@ -45,8 +39,10 @@ Four field names have a meaning. Any other is ignored.
 
 **Dispatching** is what a blank line does. If the data buffer is empty,
 the parser resets the buffers and fires nothing. Otherwise it removes
-one trailing newline from the data, takes the event type — or
-`"message"` when no `event` field appeared — and fires one event.
+one trailing newline from the data, takes the event type, which is
+`"message"` when no `event` field set one, and fires one event. A
+`data` line with an empty value still puts a newline in the buffer, so
+it dispatches an event whose data is empty.
 
 The **last event id** is not reset by a dispatch. A stream that sends an
 id once and then fifty events without one produces fifty events all
@@ -54,9 +50,11 @@ carrying that id. When the connection ends, a client sends that id back
 in a `Last-Event-ID` request header, and the server resumes from there.
 
 A client whose connection ends waits the reconnection time and opens the
-stream again. Two responses mean stop permanently instead: a status of
-204 No Content, and a response whose `Content-Type` is not
-`text/event-stream`.
+stream again. A response whose status is not 200, or whose
+`Content-Type` is not `text/event-stream`, means stop permanently
+instead (section 9.2.2 says to "fail the connection"). A server uses 204
+No Content to tell clients to go away. A network error, where no
+response arrived, is retried.
 
 The parser has no failure mode. An unknown field, a `retry` that is not
 a number, an `id` holding a NULL character and a line with no colon are
@@ -109,10 +107,8 @@ fn main() [io]
             println("wait ${ms}ms, then resume from ${ssereader.last_event_id(step.reader)}")
 ```
 
-Build and test with `novo pkg build` and `novo test`. Today `novo test`
-fails on purpose: every test reaches a
-`not implemented: sse-nv.<module>.<fn>` panic. The tests are the
-specification the implementation will have to satisfy.
+The program prints `message: hello (id 42)`, then `wait 3000ms, then
+resume from 42`.
 
 ## What the package contains
 
@@ -122,7 +118,7 @@ specification the implementation will have to satisfy.
 | `ssewire` | One line of a stream: the field names, the line shapes, and splitting text into complete lines. |
 | `ssereader` | The stream parser, fed bytes and drained of events, retry directives, comments and overflows. |
 | `ssewriter` | A server's side: an event turned back into the lines of a block. |
-| `ssereconnect` | What a client does when a connection ends, including the two responses that mean stop for good. |
+| `ssereconnect` | What a client does when a connection ends, including the responses that mean stop for good. |
 
 ## How to choose an entry point
 
@@ -162,7 +158,8 @@ client's resumption point without delivering an event.
    An event that sends no `event` field is of type `"message"`. An event
    that sends no `id` carries whatever id was last set, however long ago.
 6. **An `id` whose value holds a NULL character is ignored**, and the
-   previous id stands.
+   previous id stands. An `id` line with no value sets the id to the
+   empty string, and a reconnecting client then sends no header.
 7. **A `retry` value that is not entirely ASCII digits is ignored**, and
    the previous reconnection time stands. `retry: 5s` and `retry: -1`
    change nothing.
@@ -175,19 +172,33 @@ client's resumption point without delivering an event.
 10. **A partial block is discarded when the connection ends.** The
     stream stopped in the middle of an event, so the event was never
     dispatched.
-11. **204 No Content means stop reconnecting, permanently.** So does a
-    response whose `Content-Type` is not `text/event-stream`. Every
-    other failure is retried.
+11. **A response that is not a 200 event stream means stop reconnecting,
+    permanently.** That covers 204 No Content, which a server sends on
+    purpose, every other status, and a `Content-Type` that is not
+    `text/event-stream`. A network error with no response is retried,
+    and so is a stream that ended. Pass status 0 to
+    `ssereconnect.after_close` for a network error.
 12. **Send the last event id back when reconnecting.** The header is
     `Last-Event-ID`. An absent header and an empty one are different: a
     client with no id sends none.
 13. **A block larger than the limit is dropped, not an error.** The
     specification sets no size limit and a caller cannot buffer without
-    one, so the reader reports `SseOverflow` and resynchronises at the
-    next blank line.
+    one. A block whose data passes `max_event_bytes`, or which holds a
+    line longer than `max_line_bytes`, is dropped, and the reader
+    reports `SseOverflow` at the blank line that ends it. The stream
+    continues after that line.
 14. **A leading byte order mark is removed** from the start of the
-    stream. A stream whose first three bytes were kept has a first field
-    whose name is not `data`, and ignores it.
+    stream, even when its three bytes arrive in separate reads. A byte
+    order mark anywhere else is kept.
+15. **A carriage return is acted on as soon as it arrives.** A line
+    feed in the next read is taken as the second half of the same
+    terminator. `ssewire.split_lines`, for text that is not a live
+    stream, holds a trailing carriage return back in the remainder
+    instead.
+16. **An id holding a NULL, a carriage return or a line feed is not
+    written.** `ssewriter.encode` leaves it out, because the reader
+    would ignore it or read it as two lines. An event type holding a
+    line terminator is written up to the first one.
 
 ## What is not included
 
@@ -223,37 +234,24 @@ client's resumption point without delivering an event.
 ```bash
 novo test tests/ssereader_tests.nv   # the line grammar and the parser
 novo test tests/ssewriter_tests.nv   # the encoder and the reconnection rules
+bash tests/coverage.sh               # line coverage over src/
 ```
 
 The normative source is the WHATWG HTML standard's server-sent events
-section, and each assertion names the rule it comes from. The reference
-implementations are the JavaScript package `eventsource-parser`, for the
-incremental parser, and the Python package `sse-starlette`, for the
-server side.
+section. Its example streams are in the suite, each fed whole and in
+pieces of one, two, three and seven bytes: the stock ticker whose three
+`data` lines make one event, the four blocks whose second resets the id
+with a bare `id` line, the empty `data` fields, the two identical
+events, and the `add` and `remove` events.
 
-The suite asserts that exactly one leading space is removed from a
+The suite also asserts that exactly one leading space is removed from a
 value, that all three line terminators end a line and that a carriage
 return and line feed pair is one of them, that a block with no data
 dispatches nothing, that the last event id survives a dispatch while the
 event type does not, that a malformed `retry` leaves the time alone,
-that multi-line data is encoded as one field per line and decodes back
-unchanged, and that 204 and a wrong media type are the only permanent
-stops.
-
-The tests compile today and fail at run, each on the
-`not implemented: sse-nv.<module>.<fn>` panic that is its body. That is
-the expected state of an interface release. They turn green one at a
-time as bodies land.
-
-## Implementation status
-
-| Item | Implemented |
-| --- | --- |
-| `sseevent` — the event and its three parts | the types are declared; every body is a `todo()` |
-| `ssewire` — the line grammar | the types are declared; every body is a `todo()` |
-| `ssereader` — the stream parser | the types are declared; every body is a `todo()` |
-| `ssewriter` — the encoder | every body is a `todo()` |
-| `ssereconnect` — the reconnection rules | the types are declared; every body is a `todo()` |
+that an overlong line drops its block without ending it early, and that
+every event, including empty and multi-line data, decodes back to
+itself after `ssewriter.encode`.
 
 ## Licence
 
