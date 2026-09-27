@@ -1,40 +1,30 @@
-// sseevent.nv — the event a stream dispatches, and the three buffers
-// the specification says it is made of.
+// sseevent.nv — the event a stream dispatches.
 //
-// Every body here is a `todo()`; the signatures are the design.
+// The WHATWG HTML specification's "Server-sent events" section defines
+// a stream as lines of text, grouped into blocks by blank lines.  When a
+// blank line arrives the parser dispatches: it takes what the `event`,
+// `data` and `id` lines accumulated and fires one event with them
+// (section 9.2.6).
 //
-// WHAT AN EVENT IS
+// An event has three parts:
 //
-// The WHATWG HTML specification's "server-sent events" section defines
-// a stream as lines of text, grouped into blocks by blank lines.  When
-// a blank line arrives, the parser DISPATCHES: it takes what the
-// `event`, `data` and `id` lines of that block accumulated and fires
-// one event with them.
+//   - the type, which the `event` field set, and which is `"message"`
+//     when no `event` field set one;
+//   - the data, every `data` field's value joined by newlines;
+//   - the last event id, whatever an `id` field last set, in this block
+//     or in any earlier one.
 //
-// So an event has exactly three parts, and they are not symmetrical:
+// The last event id buffer is not reset by a dispatch.  A stream that
+// sends an id once and then fifty events without one has fifty events
+// carrying that id, and a client that reconnects sends it back.
 //
-//   - the TYPE, which the `event` field set, and which is the string
-//     `"message"` when no `event` field appeared;
-//   - the DATA, which is every `data` field's value joined by newlines,
-//     with the trailing newline removed;
-//   - the LAST EVENT ID, which is whatever the `id` field last set — IN
-//     THIS BLOCK OR IN ANY EARLIER ONE.
-//
-// The third is the one that surprises people.  The id buffer is NOT
-// reset between events: a stream that sends an id once and then fifty
-// events without one has fifty events all carrying that id, and a
-// client resuming after a drop asks for the last one it saw.  That is
-// the whole resumption mechanism, and `SseEvent.id` carries it on every
-// event so a caller never has to track it separately.
-//
-// A BLOCK WITH NO DATA DISPATCHES NOTHING
-//
-// The specification is explicit: if the data buffer is empty when a
-// blank line arrives, the parser resets the buffers and fires no event.
-// So a block of nothing but an `id` line updates the id and produces
-// no event, and a keep-alive comment produces no event either.  A
-// decoder that fired an empty event for those would deliver a stream of
-// them to any server that uses a bare `id` line as its heartbeat.
+// A block in which no `data` field appeared dispatches nothing.  A block
+// of nothing but an `id` line updates the id and fires no event, and a
+// comment fires no event either.  A `data` field with an empty value
+// does dispatch, with empty data.
+
+use std.str
+use std.list
 
 // One dispatched event.
 //
@@ -46,10 +36,7 @@
 // ```
 pub struct SseEvent
     // The event type: the `event` field's value, or `"message"` when
-    // the block had no `event` field.  Never empty — a block with
-    // `event:` and nothing after it sets the type to the empty string,
-    // and the specification then leaves it as the empty string, which
-    // `is_message` reports as false.
+    // the block had no `event` field or set it to the empty string.
     kind: Str
     // The data, with the newlines that joined its lines and without a
     // trailing one.  Text, not JSON: this package does not parse it,
@@ -71,7 +58,7 @@ pub struct SseEvent
 //     println(sseevent.event("message", "hello").data)      // hello
 // ```
 pub fn event(kind: Str, data: Str) -> SseEvent []
-    todo("sse-nv.sseevent.event")
+    SseEvent { kind: kind, data: data, id: "" }
 
 // An event of the default type `"message"`.
 //
@@ -86,7 +73,7 @@ pub fn event(kind: Str, data: Str) -> SseEvent []
 //     println(sseevent.message("hello").kind)               // message
 // ```
 pub fn message(data: Str) -> SseEvent []
-    todo("sse-nv.sseevent.message")
+    SseEvent { kind: "message", data: data, id: "" }
 
 // The same event with an id attached.
 //
@@ -97,7 +84,7 @@ pub fn message(data: Str) -> SseEvent []
 //     println(sseevent.with_id(sseevent.message("hi"), "42").id)   // 42
 // ```
 pub fn with_id(e: SseEvent, id: Str) -> SseEvent []
-    todo("sse-nv.sseevent.with_id")
+    SseEvent { kind: e.kind, data: e.data, id: id }
 
 // Whether the event is of the default type.
 //
@@ -112,7 +99,7 @@ pub fn with_id(e: SseEvent, id: Str) -> SseEvent []
 //     println("${sseevent.is_message(sseevent.message("hi"))}")     // true
 // ```
 pub fn is_message(e: SseEvent) -> Bool []
-    todo("sse-nv.sseevent.is_message")
+    e.kind == "message"
 
 // The data split back into the lines the stream sent it as.
 //
@@ -133,16 +120,19 @@ pub fn is_message(e: SseEvent) -> Bool []
 //     println("${list.len(sseevent.data_lines(sseevent.message("a\nb")))}")   // 2
 // ```
 pub fn data_lines(e: SseEvent) -> [Str] []
-    todo("sse-nv.sseevent.data_lines")
+    if e.data == ""
+        return []
+    str.split(e.data, "\n")
 
 // Whether an id may be used as the last event id.
 //
 // The specification ignores an `id` field whose value contains a NULL
-// character, and keeps the previous id instead.  A server that emitted
-// one would otherwise put a value in a `Last-Event-ID` header that
-// cannot be sent.  A caller building events to encode checks this
-// before it calls `with_id`; the decoder applies the same rule on the
-// way in.
+// character, and keeps the previous id instead.  A carriage return or a
+// line feed cannot be written in a field at all, since either ends the
+// line.  So an id holding any of the three is not usable, which is the
+// value space the `Last-Event-ID` header section describes.  A caller
+// building events to encode checks this before it calls `with_id`, and
+// `ssewriter.encode` leaves an unusable id out.
 //
 // ```novo
 // use sseevent
@@ -152,4 +142,8 @@ pub fn data_lines(e: SseEvent) -> [Str] []
 //     println("${sseevent.id_is_usable("")}")               // true
 // ```
 pub fn id_is_usable(id: Str) -> Bool []
-    todo("sse-nv.sseevent.id_is_usable")
+    for i in 0..str.len(id)
+        let b = str.byte_at_or(id, i, 0)
+        if b == 0 or b == '\n' or b == '\r'
+            return false
+    true

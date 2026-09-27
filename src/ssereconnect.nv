@@ -1,34 +1,21 @@
 // ssereconnect.nv — what a client does when the connection ends, as a
 // value rather than as a loop.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
-// THE RULES ARE SHORT AND THE TWO THAT MATTER ARE THE PERMANENT ONES
-//
 // A client whose event stream ends reconnects after the reconnection
 // time, sending its last event id back in a `Last-Event-ID` header.
-// That is the ordinary case, and a client that implemented only it has
-// written a program that hammers a server for ever.
+// That is the ordinary case (section 9.2.3).
 //
-// The specification names two responses that mean STOP, permanently:
+// A response is a permanent stop when its status is not 200, or when
+// its `Content-Type` is not `text/event-stream`: the specification says
+// to "fail the connection", and a failed connection is not retried.  A
+// 204 No Content is the one a server uses on purpose, to tell clients to
+// go away.  A network error, where no response arrived, is retried, and
+// so is a 200 stream that simply ended.
 //
-//   - a status of 204 No Content;
-//   - a response whose `Content-Type` is not `text/event-stream`.
-//
-// Neither is retried.  Both exist so a server can tell a client to go
-// away and have it actually go away — a server taking an endpoint out
-// of service answers 204 once, and every client stops.  A client that
-// retried them turns a deliberate shutdown into a load test.
-//
-// Any other failure — a connection refused, a 500, a stream that simply
-// ended — is retried.
-//
-// THIS PACKAGE DOES NOT WAIT
-//
-// The reconnection time is a NUMBER this module computes.  Sleeping is
-// `[time]` work and a `core` package may not do it, so the caller waits
-// and the by-product is that a test reconnects at any interval with no
-// fake clock.
+// This package does not wait.  The reconnection time is a number this
+// module computes, and the caller sleeps it.
+
+use std.str
 
 // What a client should do after a connection ends.
 //
@@ -44,39 +31,43 @@ pub enum SseAfterClose
     // Wait this many milliseconds, then open the stream again with the
     // `Last-Event-ID` header set.
     SseReconnectAfter(millis: Int)
-    // Do not reconnect, ever.  `why` says which of the specification's
-    // two permanent cases this was, for a log.
+    // Do not reconnect.  `why` says which of the permanent cases this
+    // was, for a log.
     SseStopPermanently(why: Str)
 
 // The decision, from the response the server gave and the reconnection
 // time in force.
 //
-// THE FUNCTION THAT KEEPS A CLIENT FROM HAMMERING A SERVER THAT ASKED
-// IT TO STOP.  A 204 and a media type that is not `text/event-stream`
-// both answer `SseStopPermanently`; everything else answers
-// `SseReconnectAfter` with the time given.
+// `status` is the response's status, or 0 when no response arrived.  A
+// status other than 200 answers `SseStopPermanently`, and so does a 200
+// whose media type is not `text/event-stream`.  A status of 0 and a 200
+// event stream that ended answer `SseReconnectAfter` with the time
+// given.
 //
-// `content_type` is the header's value as received, parameters and all
-// — `text/event-stream; charset=utf-8` is an event stream, and the
-// comparison is on the media type alone and is case-insensitive.
+// `content_type` is the header's value as received, parameters and all.
+// `text/event-stream; charset=utf-8` is an event stream: the comparison
+// is on the media type alone and ignores case.
 //
 // ```novo
 // use ssereconnect
 //
 // fn main() [io]
-//     match ssereconnect.after_close(500, "text/event-stream", 3000)
-//         SseReconnectAfter(ms)   => println("retry in ${ms}ms")
+//     match ssereconnect.after_close(0, "", 3000)
+//         SseReconnectAfter(ms)   => println("retry in ${ms}ms")   // retry in 3000ms
 //         SseStopPermanently(_)   => println("stop")
 // ```
 pub fn after_close(status: Int, content_type: Str, retry_millis: Int) -> SseAfterClose []
-    todo("sse-nv.ssereconnect.after_close")
+    if is_permanent_status(status)
+        return SseStopPermanently("status ${status}")
+    if status == 200 and not is_event_stream(content_type)
+        return SseStopPermanently("content type ${content_type}")
+    SseReconnectAfter(retry_millis)
 
 // Whether a `Content-Type` header value is an event stream.
 //
 // True for `text/event-stream` with any parameters and in any case.
-// False for everything else, including an empty header — a response
-// with no media type at all is not an event stream, and is one of the
-// two permanent stops.
+// False for everything else, including an empty header: a response with
+// no media type is not an event stream.
 //
 // ```novo
 // use ssereconnect
@@ -86,30 +77,32 @@ pub fn after_close(status: Int, content_type: Str, retry_millis: Int) -> SseAfte
 //     println("${ssereconnect.is_event_stream("text/plain")}")   // false
 // ```
 pub fn is_event_stream(content_type: Str) -> Bool []
-    todo("sse-nv.ssereconnect.is_event_stream")
+    var media = content_type
+    if let Some(at) = str.index(content_type, ";")
+        media = str.slice(content_type, 0, at)
+    str.lower(str.trim(media)) == "text/event-stream"
 
 // Whether a status means stop for good rather than retry.
 //
-// True for 204 only.  Not for 404, not for 500, not for 503 — the
-// specification names one status and a client that invented more of
-// them stops reconnecting to a server that was merely restarting.
+// True for every status except 200, the one a working stream answers.
+// False for 0, which stands for a network error where no response
+// arrived and which the specification retries.
 //
 // ```novo
 // use ssereconnect
 //
 // fn main() [io]
 //     println("${ssereconnect.is_permanent_status(204)}")   // true
-//     println("${ssereconnect.is_permanent_status(503)}")   // false
+//     println("${ssereconnect.is_permanent_status(0)}")     // false
 // ```
 pub fn is_permanent_status(status: Int) -> Bool []
-    todo("sse-nv.ssereconnect.is_permanent_status")
+    status != 200 and status != 0
 
 // The reconnection time a client starts with, in milliseconds.
 //
-// The specification leaves this to the implementation.  This package
-// says three seconds, which is what the reference implementations
-// settled on, and a server that wants another number sends a `retry`
-// field and gets it.
+// The specification leaves this to the implementation, "probably in
+// the region of a few seconds".  This package says three seconds, and a
+// server that wants another number sends a `retry` field.
 //
 // ```novo
 // use ssereconnect
@@ -118,7 +111,7 @@ pub fn is_permanent_status(status: Int) -> Bool []
 //     println("${ssereconnect.default_retry_millis()}")     // 3000
 // ```
 pub fn default_retry_millis() -> Int []
-    todo("sse-nv.ssereconnect.default_retry_millis")
+    3000
 
 // The `Last-Event-ID` request header a reconnecting client sends, or
 // `None` when it has no id to send.
@@ -137,15 +130,15 @@ pub fn default_retry_millis() -> Int []
 //         Some(v) => println(v)                             // 42
 // ```
 pub fn last_event_id_header(last_event_id: Str) -> ?Str []
-    todo("sse-nv.ssereconnect.last_event_id_header")
+    if last_event_id == ""
+        return None
+    Some(last_event_id)
 
 // The name of that header.
 //
-// One function rather than a literal in every client, and the spelling
-// is the specification's: `Last-Event-ID`, with the last two letters
-// capitalised.  HTTP field names are case-insensitive, and a server
-// matching them case-sensitively is common enough to be worth not
-// provoking.
+// The spelling is the specification's: `Last-Event-ID`, with the last
+// two letters capitalised.  HTTP field names are case-insensitive, and
+// servers that match them case-sensitively exist.
 //
 // ```novo
 // use ssereconnect
@@ -154,4 +147,4 @@ pub fn last_event_id_header(last_event_id: Str) -> ?Str []
 //     println(ssereconnect.last_event_id_header_name())     // Last-Event-ID
 // ```
 pub fn last_event_id_header_name() -> Str []
-    todo("sse-nv.ssereconnect.last_event_id_header_name")
+    "Last-Event-ID"

@@ -1,42 +1,32 @@
 // ssereader.nv — the stream parser, as a reader that is fed bytes and
 // drained of what they meant.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
-// THE READER IS THE SPECIFICATION's FOUR BUFFERS
-//
-// The WHATWG stream parser holds four things between lines: a data
+// The parser holds four things between lines (section 9.2.6): a data
 // buffer, an event type buffer, a last event id buffer and a
-// reconnection time.  The first two are reset on every dispatch and the
-// last two are NOT — which is the whole of the resumption mechanism,
-// and the reason this is a reader rather than a function over a string.
+// reconnection time.  A dispatch resets the first two and leaves the
+// last two, which is what lets a client resume.
 //
-// FEED AND DRAIN, BECAUSE THIS IS `core`
-//
-// This package reads no socket.  The host reads bytes however it likes
-// and hands them here; `feed` takes bytes and produces at most one
-// signal, and `take` produces the next one already buffered.  A read of
-// 8 KiB holding forty events gives one from `feed` and thirty-nine from
+// This package reads no socket.  The caller reads bytes however it
+// likes and hands them here: `feed` adds bytes and answers at most one
+// signal, and `take` answers the next one from what is already held.  A
+// read holding forty events gives one from `feed` and thirty-nine from
 // `take`, and a caller loops until `take` answers `None`.
 //
-// NOTHING HERE FAILS
+// Nothing here fails.  The specification's parser ignores what it does
+// not understand at every level, and a decoder that refused any of it
+// would disconnect from a server that is behaving as specified.
 //
-// There is no `Result` in this module and no error type in this
-// package.  The specification's parser ignores what it does not
-// understand, at every level: an unknown field, a malformed `retry`, an
-// `id` holding a NULL, a line with no colon.  A decoder that refused
-// any of them would disconnect from a server that is behaving exactly
-// as specified.
-//
-// The one thing that is not in the specification is a SIZE LIMIT, and
-// it is not an error either.  An event stream is unbounded by design
-// and a caller cannot buffer without a bound, so a block that grows
-// past `max_event_bytes` is DROPPED and reported as `SseOverflow`.  The
-// stream carries on at the next blank line, which is the only behaviour
-// that keeps a long-running client alive against a server having a bad
-// day.
+// The one rule that is not in the specification is a size limit.  A
+// caller cannot buffer without a bound, so a block that grows past
+// `max_event_bytes`, or a line past `max_line_bytes`, is dropped and
+// reported as `SseOverflow` at the blank line that ends it.  The stream
+// continues after that line.
 
+use std.str
+use std.bytes
 use sseevent
+use ssewire
+use ssereconnect
 
 // What a reader refuses to grow past.
 //
@@ -85,17 +75,30 @@ pub enum SseSignal
 // signal".
 //
 // Opaque: the fields are here because a struct needs them, and a caller
-// that reaches into one has coupled itself to a buffering decision this
-// package intends to change.  `last_event_id`, `retry_millis` and
-// `pending_len` are the facts about a reader that are anybody's
-// business.
+// that reads one has coupled itself to a buffering decision this
+// package may change.  `last_event_id`, `retry_millis` and `pending_len`
+// are the facts about a reader a caller needs.
 pub struct SseReader
     limits: SseLimits
+    // Text fed and not yet read, from offset `at`.
     pending: Str
+    at: Int
     data_buffer: Str
     type_buffer: Str
     last_id: Str
     retry: Int
+    // True until the first byte of the stream has been seen, so a byte
+    // order mark there is removed.
+    at_start: Bool
+    // True when the last line ended in a carriage return that may be
+    // the first half of a CRLF pair, so a line feed next is skipped.
+    after_cr: Bool
+    // Bytes of the current block dropped for a limit, or -1 when the
+    // block is being kept.
+    dropped: Int
+    // True while the rest of a line too long to keep is being dropped,
+    // so its terminator ends that line and is not read as a blank one.
+    in_long_line: Bool
 
 // A reader and the one signal that came out of it, if one did.
 //
@@ -121,7 +124,7 @@ pub struct SseStep
 //     println("${ssereader.default_limits().max_event_bytes}")
 // ```
 pub fn default_limits() -> SseLimits []
-    todo("sse-nv.ssereader.default_limits")
+    SseLimits { max_event_bytes: 1048576, max_line_bytes: 65536 }
 
 // An event of 4 KiB and a line of 512 bytes.
 //
@@ -136,7 +139,7 @@ pub fn default_limits() -> SseLimits []
 //     println("${ssereader.small_limits().max_line_bytes}")
 // ```
 pub fn small_limits() -> SseLimits []
-    todo("sse-nv.ssereader.small_limits")
+    SseLimits { max_event_bytes: 4096, max_line_bytes: 512 }
 
 // A reader holding nothing, with no id and the default reconnection
 // time.
@@ -148,13 +151,13 @@ pub fn small_limits() -> SseLimits []
 //     println(ssereader.last_event_id(ssereader.reader(ssereader.default_limits())))
 // ```
 pub fn reader(limits: SseLimits) -> SseReader []
-    todo("sse-nv.ssereader.reader")
+    resuming(limits, "")
 
 // A reader that resumes: it starts with the last event id a previous
 // connection reached.
 //
-// THE OTHER HALF OF RESUMPTION.  A client that dropped sends the id
-// back as a `Last-Event-ID` header, and the server replays from there.
+// A client that dropped sends the id back as a `Last-Event-ID` header,
+// and the server replays from there.
 // The reader needs the same id, because the events the server replays
 // may not repeat it and the events after them must still carry it.  A
 // client that reconnected with a fresh reader would report `""` as the
@@ -169,16 +172,18 @@ pub fn reader(limits: SseLimits) -> SseReader []
 //     println(ssereader.last_event_id(r))                   // 42
 // ```
 pub fn resuming(limits: SseLimits, last_event_id: Str) -> SseReader []
-    todo("sse-nv.ssereader.resuming")
+    SseReader { limits: limits, pending: "", at: 0, data_buffer: "", type_buffer: "",
+                last_id: last_event_id, retry: ssereconnect.default_retry_millis(),
+                at_start: true, after_cr: false, dropped: -1, in_long_line: false }
 
 // Adds bytes, and takes one signal if the addition produced one.
 //
-// The bytes are the stream's, UTF-8, and a BYTE ORDER MARK at the very
-// start is removed — the specification requires it, and a stream whose
-// first three bytes were kept would have a `data` field named
-// `"﻿data"` and would ignore it.
+// The bytes are the stream's, UTF-8, and a byte order mark at the very
+// start is removed, as the UTF-8 decode the specification requires does.
+// A stream whose first three bytes were kept would have a first field
+// named with them, and would ignore it.
 //
-// Takes ONE.  A read that produced forty signals leaves thirty-nine
+// Takes one signal.  A read that produced forty leaves thirty-nine
 // inside, and `take` is what gets them.
 //
 // ```novo
@@ -192,8 +197,8 @@ pub fn resuming(limits: SseLimits, last_event_id: Str) -> SseReader []
 //         None    => println("partial")
 //         Some(_) => println("a signal")
 // ```
-pub fn feed(r: SseReader, bytes: [u8]) -> SseStep []
-    todo("sse-nv.ssereader.feed")
+pub fn feed(r: SseReader, chunk: [u8]) -> SseStep []
+    feed_text(r, bytes.to_str(bytes.from_byte_list(chunk)))
 
 // Adds text rather than bytes.
 //
@@ -211,7 +216,21 @@ pub fn feed(r: SseReader, bytes: [u8]) -> SseStep []
 //         Some(_) => println("a signal")
 // ```
 pub fn feed_text(r: SseReader, text: Str) -> SseStep []
-    todo("sse-nv.ssereader.feed_text")
+    let rest = str.slice(r.pending, r.at, str.len(r.pending))
+    var all = rest + text
+    var begun = r.at_start
+    // The first three bytes decide whether the stream opens with a byte
+    // order mark, and they may arrive in separate reads.
+    if begun and str.len(all) >= 3
+        begun = false
+        if str.starts_with(all, "\u{FEFF}")
+            all = str.slice(all, 3, str.len(all))
+    else if begun and not str.starts_with("\u{FEFF}", all)
+        begun = false
+    take(SseReader { limits: r.limits, pending: all, at: 0,
+                     data_buffer: r.data_buffer, type_buffer: r.type_buffer,
+                     last_id: r.last_id, retry: r.retry, at_start: begun,
+                     after_cr: r.after_cr, dropped: r.dropped, in_long_line: r.in_long_line })
 
 // Takes one signal if a complete one is already buffered, adding
 // nothing.
@@ -230,18 +249,25 @@ pub fn feed_text(r: SseReader, text: Str) -> SseStep []
 //         None    => println("nothing buffered")
 // ```
 pub fn take(r: SseReader) -> SseStep []
-    todo("sse-nv.ssereader.take")
+    var cur = r
+    loop
+        let found = next_line(cur)
+        match found.line
+            None       =>
+                return SseStep { reader: found.reader, signal: None }
+            Some(line) =>
+                let step = apply(found.reader, line)
+                if let Some(_) = step.signal
+                    return step
+                cur = step.reader
 
 // Tells the reader the connection closed, and takes the last signal.
 //
-// THE SPECIFICATION DISPATCHES NOTHING AT A CLOSE.  A block that was
-// still accumulating when the connection dropped is discarded: the
-// stream ended in the middle of an event and the event was never
-// dispatched, so delivering it would deliver an event the server did
-// not finish sending.  This function exists to say so — it answers
-// `None` and a reader whose block buffers are empty — and because a
-// caller needs somewhere to ask what the last event id and retry time
-// ended up as before it reconnects.
+// The specification dispatches nothing at a close: "If the file ends in
+// the middle of an event, before the final empty line, the incomplete
+// event is not dispatched."  This answers `None` and a reader whose
+// block buffers and pending text are empty, keeping the last event id
+// and the reconnection time a caller reads before it reconnects.
 //
 // ```novo
 // use ssereader
@@ -253,7 +279,11 @@ pub fn take(r: SseReader) -> SseStep []
 //         None    => println("a partial block is discarded")
 // ```
 pub fn finish(r: SseReader) -> SseStep []
-    todo("sse-nv.ssereader.finish")
+    SseStep { reader: SseReader { limits: r.limits, pending: "", at: 0, data_buffer: "",
+                                  type_buffer: "", last_id: r.last_id, retry: r.retry,
+                                  at_start: r.at_start, after_cr: false, dropped: -1,
+                                  in_long_line: false },
+              signal: None }
 
 // The last event id the stream has set, or `""`.
 //
@@ -269,7 +299,7 @@ pub fn finish(r: SseReader) -> SseStep []
 //         ssereader.default_limits(), "42")))               // 42
 // ```
 pub fn last_event_id(r: SseReader) -> Str []
-    todo("sse-nv.ssereader.last_event_id")
+    r.last_id
 
 // The reconnection time in milliseconds the stream last set.
 //
@@ -285,7 +315,7 @@ pub fn last_event_id(r: SseReader) -> Str []
 //         ssereader.default_limits()))}")
 // ```
 pub fn retry_millis(r: SseReader) -> Int []
-    todo("sse-nv.ssereader.retry_millis")
+    r.retry
 
 // How many bytes of an unfinished line and an unfinished block the
 // reader is holding.
@@ -301,4 +331,128 @@ pub fn retry_millis(r: SseReader) -> Int []
 //         ssereader.default_limits()))}")                   // 0
 // ```
 pub fn pending_len(r: SseReader) -> Int []
-    todo("sse-nv.ssereader.pending_len")
+    str.len(r.pending) - r.at + str.len(r.data_buffer)
+
+// A line read off the front of a reader's pending text, or `None` when
+// no complete line is there yet.
+struct SseLineRead
+    reader: SseReader
+    line: ?Str
+
+// `r` with its pending text read from `at` and `after_cr` set as given.
+fn moved(r: SseReader, at: Int, after_cr: Bool) -> SseReader
+    SseReader { limits: r.limits, pending: r.pending, at: at, data_buffer: r.data_buffer,
+                type_buffer: r.type_buffer, last_id: r.last_id, retry: r.retry,
+                at_start: r.at_start, after_cr: after_cr, dropped: r.dropped,
+                in_long_line: r.in_long_line }
+
+// `r` after `count` more bytes of an overlong line were dropped, with
+// its pending text read from `at`.
+fn cut(r: SseReader, at: Int, count: Int, in_long_line: Bool, after_cr: Bool) -> SseReader
+    SseReader { limits: r.limits, pending: r.pending, at: at, data_buffer: "",
+                type_buffer: "", last_id: r.last_id, retry: r.retry, at_start: r.at_start,
+                after_cr: after_cr, dropped: dropping(r) + count, in_long_line: in_long_line }
+
+// The next complete line of `r`'s pending text.
+//
+// A carriage return ends a line at once.  A line feed straight after it
+// is the second half of the same terminator, and is skipped whether it
+// arrives in the same read or the next one.  An unterminated line longer
+// than `max_line_bytes` is dropped as it arrives, and the block it is in
+// is dropped with it.
+fn next_line(r: SseReader) -> SseLineRead
+    let n = str.len(r.pending)
+    var start = r.at
+    if r.after_cr and start < n and str.byte_at_or(r.pending, start, 0) == '\n'
+        start = start + 1
+    let end = terminator_at(r.pending, start)
+    if r.in_long_line
+        if end < 0
+            return SseLineRead { reader: cut(r, n, n - start, true, false), line: None }
+        let ended = str.byte_at_or(r.pending, end, 0) == '\r'
+        return next_line(cut(r, end + 1, end + 1 - start, false, ended))
+    if end >= 0
+        let line = str.slice(r.pending, start, end)
+        let ended = str.byte_at_or(r.pending, end, 0) == '\r'
+        return SseLineRead { reader: moved(r, end + 1, ended), line: Some(line) }
+    if n - start > r.limits.max_line_bytes
+        return SseLineRead { reader: cut(r, n, n - start, true, false), line: None }
+    let after_cr = r.after_cr and start == r.at
+    SseLineRead { reader: moved(r, start, after_cr), line: None }
+
+// The offset of the first CR or LF in `text` at or after `from`, or -1.
+fn terminator_at(text: Str, from: Int) -> Int
+    for i in from..str.len(text)
+        let b = str.byte_at_or(text, i, 0)
+        if b == '\n' or b == '\r'
+            return i
+    -1
+
+// The bytes the current block has dropped so far, counting its data
+// buffer when it is dropped now.
+fn dropping(r: SseReader) -> Int
+    if r.dropped >= 0
+        return r.dropped
+    str.len(r.data_buffer)
+
+// `r` with its block buffers replaced.
+fn with_block(r: SseReader, data: Str, kind: Str, id: Str, retry: Int, dropped: Int) -> SseReader
+    SseReader { limits: r.limits, pending: r.pending, at: r.at, data_buffer: data,
+                type_buffer: kind, last_id: id, retry: retry, at_start: r.at_start,
+                after_cr: r.after_cr, dropped: dropped, in_long_line: r.in_long_line }
+
+// One line applied to the reader, with the signal it produced.
+fn apply(r: SseReader, line: Str) -> SseStep
+    if r.dropped >= 0
+        if line == ""
+            let resumed = with_block(r, "", "", r.last_id, r.retry, -1)
+            return SseStep { reader: resumed, signal: Some(SseOverflow(r.dropped)) }
+        let more = with_block(r, "", "", r.last_id, r.retry, r.dropped + str.len(line) + 1)
+        return SseStep { reader: more, signal: None }
+    match ssewire.parse_line(line)
+        SseDispatchLine      => dispatched(r)
+        SseCommentLine(text) => SseStep { reader: r, signal: Some(SseComment(text)) }
+        SseFieldLine(f, v)   => field(r, f, v)
+
+// The blank line: an event when the block had data, and nothing when
+// it had none.
+fn dispatched(r: SseReader) -> SseStep
+    let cleared = with_block(r, "", "", r.last_id, r.retry, -1)
+    if r.data_buffer == ""
+        return SseStep { reader: cleared, signal: None }
+    var data = r.data_buffer
+    if str.ends_with(data, "\n")
+        data = str.slice(data, 0, str.len(data) - 1)
+    var kind = r.type_buffer
+    if kind == ""
+        kind = "message"
+    let e = sseevent.with_id(sseevent.event(kind, data), r.last_id)
+    SseStep { reader: cleared, signal: Some(SseDispatch(e)) }
+
+// One field applied to the block.
+fn field(r: SseReader, f: ssewire.SseFieldKind, value: Str) -> SseStep
+    match f
+        SseFieldEvent    =>
+            SseStep { reader: with_block(r, r.data_buffer, value, r.last_id, r.retry, -1),
+                signal: None }
+        SseFieldData     =>
+            let data = r.data_buffer + value + "\n"
+            if str.len(data) > r.limits.max_event_bytes
+                let over = with_block(r, "", "", r.last_id, r.retry, str.len(data))
+                return SseStep { reader: over, signal: None }
+            SseStep { reader: with_block(r, data, r.type_buffer, r.last_id, r.retry, -1),
+                signal: None }
+        SseFieldId       =>
+            if not sseevent.id_is_usable(value)
+                return SseStep { reader: r, signal: None }
+            SseStep { reader: with_block(r, r.data_buffer, r.type_buffer, value, r.retry, -1),
+                      signal: None }
+        SseFieldRetry    =>
+            if not ssewire.is_retry_value(value)
+                return SseStep { reader: r, signal: None }
+            match str.to_int(value)
+                Some(ms) =>
+                    let set = with_block(r, r.data_buffer, r.type_buffer, r.last_id, ms, -1)
+                    SseStep { reader: set, signal: Some(SseRetry(ms)) }
+                None     => SseStep { reader: r, signal: None }
+        SseFieldOther(_) => SseStep { reader: r, signal: None }

@@ -1,14 +1,11 @@
 // ssereader_tests.nv — the API suite for the line grammar and the
 // stream parser.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: sse-nv.<module>.<fn>`.
-//
-// THE CASES ARE THE ONES THE SPECIFICATION SPELLS OUT AND
-// IMPLEMENTATIONS STILL GET WRONG: exactly one leading space removed
-// from a field value, a bare carriage return as a line terminator, a
-// block with no data dispatching nothing, and an id buffer that
-// survives a dispatch.  Each is named with the rule it comes from.
+// The cases are the ones the specification spells out: exactly one
+// leading space removed from a field value, a bare carriage return as a
+// line terminator, a block with no data dispatching nothing, and an id
+// buffer that survives a dispatch.  The streams of section 9.2.6's
+// examples are fed whole and byte by byte.
 
 use std.test
 use std.list
@@ -86,13 +83,13 @@ fn test_all_three_line_terminators_end_a_line() [io]
     test.case("a line feed")
     test.assert(list.len(ssewire.split_lines("a\nb\n").lines) == 2)
 
-    test.case("a carriage return and line feed pair is ONE terminator")
+    test.case("a carriage return and line feed pair is one terminator")
     // A parser that split on each character sees a blank line between
     // every pair and dispatches a block on each.
     test.assert(list.len(ssewire.split_lines("a\r\nb\r\n").lines) == 2)
 
     test.case("and a bare carriage return, which implementations forget")
-    test.assert(list.len(ssewire.split_lines("a\rb\r").lines) == 2)
+    test.assert(list.len(ssewire.split_lines("a\rb\rc").lines) == 2)
 
 @test
 fn test_an_unterminated_tail_is_held_back() [io]
@@ -108,7 +105,10 @@ fn test_an_unterminated_tail_is_held_back() [io]
     // The next byte may be the line feed that belongs to it, and
     // consuming it would make one terminator into two.
     let t = ssewire.split_lines("a\r")
-    test.assert(t.remainder == "\r")
+    test.assert(list.len(t.lines) == 0)
+    test.assert(t.remainder == "a\r")
+    let u = ssewire.split_lines(t.remainder + "\nb\n")
+    test.assert(list.len(u.lines) == 2)
 
 @test
 fn test_a_retry_value_is_digits_or_it_is_ignored() [io]
@@ -286,3 +286,154 @@ fn test_a_resuming_reader_starts_with_the_id_it_was_given() [io]
     match ssereader.feed(r, u8s("data: a\n\n")).signal
         Some(SseDispatch(e)) => test.assert(e.id == "42")
         _                    => test.fail("that is one event")
+
+// ── Section 9.2.6's example streams ─────────────────────────────────
+
+// Every signal a reader produces from `text`, fed in pieces of `size`
+// bytes.
+fn signals_of(text: Str, size: Int) -> [ssereader.SseSignal]
+    var out: [ssereader.SseSignal] = []
+    var r = fresh()
+    let n = str.len(text)
+    for k in 0..(n + size - 1) / size
+        let i = k * size
+        var end = i + size
+        if end > n
+            end = n
+        var step = ssereader.feed_text(r, str.slice(text, i, end))
+        loop
+            match step.signal
+                Some(s) => list.push(out, s)
+                None    =>
+                    break
+            step = ssereader.take(step.reader)
+        r = step.reader
+    out
+
+// The events among `signals`, as `type|data|id` strings.
+fn events_of(signals: [ssereader.SseSignal]) -> [Str]
+    var out: [Str] = []
+    for s in signals
+        if let SseDispatch(e) = s
+            list.push(out, "${e.kind}|${e.data}|${e.id}")
+    out
+
+fn assert_events(text: Str, want: [Str])
+    for size in [1, 2, 3, 7, 1000]
+        test.assert(events_of(signals_of(text, size)) == want)
+
+@test
+fn test_the_stock_ticker_example() [io]
+    // "data: YHOO", "data: +2", "data: 10" dispatch "YHOO\n+2\n10".
+    assert_events("data: YHOO\ndata: +2\ndata: 10\n\n", ["message|YHOO\n+2\n10|"])
+
+@test
+fn test_the_four_block_example() [io]
+    // A comment, an event with id 1, an event that resets the id with a
+    // bare `id` line, and an event whose data keeps one leading space.
+    let text = ": test stream\n\ndata: first event\nid: 1\n\ndata:second event\nid\n\ndata:  third event\n\n"
+    assert_events(text, ["message|first event|1", "message|second event|", "message| third event|"])
+
+@test
+fn test_the_empty_data_example() [io]
+    // "data" dispatches empty data, "data\ndata" dispatches one
+    // newline, and a final block with no blank line after it is
+    // discarded.
+    assert_events("data\n\ndata\ndata\n\ndata:", ["message||", "message|\n|"])
+
+@test
+fn test_the_two_identical_events_example() [io]
+    assert_events("data:test\n\ndata: test\n\n", ["message|test|", "message|test|"])
+
+@test
+fn test_the_add_and_remove_example() [io]
+    let text = "event: add\ndata: 73857293\n\nevent: remove\ndata: 2153\n\nevent: add\ndata: 113411\n\n"
+    assert_events(text, ["add|73857293|", "remove|2153|", "add|113411|"])
+
+@test
+fn test_every_terminator_and_a_byte_order_mark() [io]
+    let want = ["message|a|", "message|b|"]
+    assert_events("data: a\r\rdata: b\r\r", want)
+    assert_events("data: a\r\n\r\ndata: b\r\n\r\n", want)
+    assert_events("\u{FEFF}data: a\n\ndata: b\n\n", want)
+    test.case("a byte order mark later in the stream is not removed")
+    assert_events("data: a\n\n\u{FEFF}data: b\n\n", ["message|a|"])
+
+@test
+fn test_an_unknown_field_and_a_colonless_line_are_ignored() [io]
+    assert_events("Data: x\nfoo: y\nbar\ndata: z\n\n", ["message|z|"])
+    test.case("an empty event field leaves the default type")
+    assert_events("event:\ndata: x\n\n", ["message|x|"])
+
+@test
+fn test_an_id_holding_a_null_keeps_the_previous_id() [io]
+    assert_events("id: 1\ndata: a\n\nid: 2\u{0}\ndata: b\n\n", ["message|a|1", "message|b|1"])
+
+@test
+fn test_a_retry_too_large_to_hold_is_ignored() [io]
+    let step = ssereader.feed(fresh(), u8s("retry: 99999999999999999999999\n"))
+    test.assert(ssereader.retry_millis(step.reader) == 3000)
+
+@test
+fn test_an_overlong_line_drops_its_block_and_the_stream_continues() [io]
+    let small = ssereader.reader(ssereader.small_limits())
+    let big = str.repeat("x", 600)
+    test.case("a line past the limit, arriving unterminated")
+    var step = ssereader.feed_text(small, "data: a\ndata: ${big}")
+    test.assert(ssereader.pending_len(step.reader) == 0)
+    step = ssereader.feed_text(step.reader, "yy\nevent: e\n\ndata: next\n\n")
+    match step.signal
+        // `a` and its newline, the 606 bytes of the long line and the
+        // `yy` that ends it, and `event: e` with its newline.
+        Some(SseOverflow(n)) => test.assert(n == 2 + 606 + 3 + 9)
+        _                    => test.fail("the block was dropped")
+    match ssereader.take(step.reader).signal
+        Some(SseDispatch(e)) =>
+            test.assert(e.data == "next")
+            test.assert(e.kind == "message")
+        _                    => test.fail("the stream continues after the blank line")
+
+@test
+fn test_finish_keeps_the_id_and_the_retry_time() [io]
+    let step = ssereader.feed_text(fresh(), "id: 9\nretry: 100\ndata: half")
+    let after = ssereader.take(step.reader)
+    let done = ssereader.finish(after.reader)
+    test.assert(ssereader.last_event_id(done.reader) == "9")
+    test.assert(ssereader.retry_millis(done.reader) == 100)
+    test.assert(ssereader.pending_len(done.reader) == 0)
+    test.assert(ssereader.small_limits().max_event_bytes == 4096)
+
+@test
+fn test_the_terminator_of_an_overlong_line_is_not_a_blank_line() [io]
+    let small = ssereader.reader(ssereader.small_limits())
+    let big = str.repeat("x", 600)
+    var step = ssereader.feed_text(small, "data: ${big}")
+    step = ssereader.feed_text(step.reader, "\r")
+    test.case("the long line's own terminator dispatches nothing")
+    match step.signal
+        Some(_) => test.fail("that CR ends the long line")
+        None    => test.assert(true)
+    step = ssereader.feed_text(step.reader, "\ndata: b\n\n")
+    match step.signal
+        Some(SseOverflow(n)) => test.assert(n == 606 + 1 + 8)
+        _                    => test.fail("the block was dropped")
+
+@test
+fn test_the_field_names_and_the_empty_data_lines() [io]
+    test.assert(ssewire.field_name(SseFieldEvent) == "event")
+    test.assert(ssewire.field_name(SseFieldId) == "id")
+    test.assert(ssewire.field_name(SseFieldRetry) == "retry")
+    test.assert(ssewire.field_name(SseFieldOther("x")) == "x")
+    test.assert(list.len(sseevent.data_lines(sseevent.message(""))) == 0)
+
+@test
+fn test_an_overlong_line_arriving_over_several_reads_is_dropped_whole() [io]
+    let small = ssereader.reader(ssereader.small_limits())
+    let big = str.repeat("x", 600)
+    var step = ssereader.feed_text(small, "data: ${big}")
+    step = ssereader.feed_text(step.reader, "more")
+    test.assert(ssereader.pending_len(step.reader) == 0)
+    step = ssereader.feed_text(step.reader, "\n\n")
+    match step.signal
+        Some(SseOverflow(n)) => test.assert(n == 606 + 4 + 1)
+        _                    => test.fail("the block was dropped")

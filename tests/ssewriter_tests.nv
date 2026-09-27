@@ -1,18 +1,15 @@
 // ssewriter_tests.nv — the API suite for the encoder and for the
 // reconnection rules.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: sse-nv.<module>.<fn>`.
-//
-// THE ENCODER's ONE HARD CASE IS THE NEWLINE.  A `data` value may not
-// contain one, because a newline is what ends the line — so an event
-// whose data is three lines is three `data` fields, and a server that
-// wrote one field with the newlines still in it sent a block whose
-// second line is whatever came after.  The round-trip tests below are
-// what catch that.
+// The encoder's one hard case is the line terminator.  A `data` value
+// may not contain one, because a terminator ends the line, so an event
+// whose data is three lines is three `data` fields.  The round-trip
+// tests below are what catch a server that wrote one field with the
+// newlines still in it.
 
 use std.test
 use std.str
+use std.list
 use sseevent
 use ssereader
 use ssewriter
@@ -125,26 +122,38 @@ fn test_the_retry_line_and_the_media_type() [io]
     test.assert(ssewriter.content_type() == "text/event-stream")
 
 @test
-fn test_the_two_permanent_stops_are_the_only_ones() [io]
+fn test_a_response_that_is_not_a_200_event_stream_is_a_permanent_stop() [io]
+    // Section 9.2.2: "if res's status is not 200, or if res's
+    // `Content-Type` is not `text/event-stream`, then fail the
+    // connection", and a failed connection is not retried.
     test.case("204 No Content means stop for good")
     match ssereconnect.after_close(204, "text/event-stream", 3000)
-        SseStopPermanently(_) => test.assert(true)
-        SseReconnectAfter(_)  => test.fail("204 is not retried")
+        SseStopPermanently(why) => test.assert(why == "status 204")
+        SseReconnectAfter(_)    => test.fail("204 is not retried")
 
     test.case("and so does a media type that is not text/event-stream")
     match ssereconnect.after_close(200, "text/plain", 3000)
-        SseStopPermanently(_) => test.assert(true)
-        SseReconnectAfter(_)  => test.fail("that is not an event stream")
+        SseStopPermanently(why) => test.assert(why == "content type text/plain")
+        SseReconnectAfter(_)    => test.fail("that is not an event stream")
 
-    test.case("a 500 is retried, because the server may be restarting")
+    test.case("and so does any other status")
     match ssereconnect.after_close(500, "text/event-stream", 3000)
-        SseReconnectAfter(ms) => test.assert(ms == 3000)
-        SseStopPermanently(_) => test.fail("500 is retried")
-
-    test.case("and so is a 503, which a client must not invent a rule for")
-    test.assert(not ssereconnect.is_permanent_status(503))
-    test.assert(not ssereconnect.is_permanent_status(404))
+        SseStopPermanently(_) => test.assert(true)
+        SseReconnectAfter(_)  => test.fail("a 500 fails the connection")
+    test.assert(ssereconnect.is_permanent_status(503))
+    test.assert(ssereconnect.is_permanent_status(404))
     test.assert(ssereconnect.is_permanent_status(204))
+
+    test.case("a network error, where no response arrived, is retried")
+    test.assert(not ssereconnect.is_permanent_status(0))
+    match ssereconnect.after_close(0, "", 3000)
+        SseReconnectAfter(ms) => test.assert(ms == 3000)
+        SseStopPermanently(_) => test.fail("a network error is retried")
+
+    test.case("and so is a 200 event stream that ended")
+    match ssereconnect.after_close(200, "text/event-stream; charset=utf-8", 5000)
+        SseReconnectAfter(ms) => test.assert(ms == 5000)
+        SseStopPermanently(_) => test.fail("an ended stream is retried")
 
 @test
 fn test_the_media_type_match_ignores_parameters_and_case() [io]
@@ -195,3 +204,71 @@ fn test_an_event_is_what_its_three_parts_say() [io]
 
     test.case("empty data is no lines, not one empty line")
     test.assert(str.len(sseevent.message("").data) == 0)
+
+// ── The specification's examples, and the encoder's edges ──────────
+
+@test
+fn test_a_carriage_return_in_data_is_a_line_break_too() [io]
+    let out = ssewriter.encode(sseevent.message("a\rb\r\nc"))
+    test.assert(str.count(out, "data: ") == 3)
+    match dispatched(out)
+        Some(e) => test.assert(e.data == "a\nb\nc")
+        None    => test.fail("this package's own output decodes")
+
+@test
+fn test_empty_data_and_trailing_newlines_round_trip() [io]
+    for data in ["", "\n", "a\n", " leading space", "  two"]
+        match dispatched(ssewriter.encode(sseevent.message(data)))
+            Some(e) => test.assert(e.data == data)
+            None    => test.fail("empty data still dispatches an event")
+
+@test
+fn test_an_unusable_id_or_type_is_left_out() [io]
+    test.case("an id holding a NULL, a CR or an LF is not written")
+    for id in ["4\u{0}2", "4\n2", "4\r2"]
+        let out = ssewriter.encode(sseevent.with_id(sseevent.message("x"), id))
+        test.assert(not str.contains(out, "id:"))
+        test.assert(not sseevent.id_is_usable(id))
+    test.case("and id_only writes an empty id for one")
+    test.assert(ssewriter.id_only("4\n2") == "id\n\n")
+    test.case("a type is written up to its first line terminator")
+    test.assert(str.starts_with(ssewriter.encode(sseevent.event("up\ndate", "x")), "event: up\n"))
+    test.case("and an empty type is the default")
+    test.assert(not str.contains(ssewriter.encode(sseevent.event("", "x")), "event"))
+
+@test
+fn test_a_comment_keeps_its_text_across_the_round_trip() [io]
+    test.assert(ssewriter.comment("ping") == ":ping\n")
+    test.assert(ssewriter.comment(" ping") == ":  ping\n")
+    test.assert(ssewriter.comment("a\nb") == ":a\n:b\n")
+    test.assert(ssewriter.keep_alive() == ":\n")
+    test.assert(ssewriter.retry(5000) == "retry: 5000\n")
+    let r = ssereader.reader(ssereader.default_limits())
+    match ssereader.feed_text(r, ssewriter.comment(" ping")).signal
+        Some(SseComment(t)) => test.assert(t == " ping")
+        _                   => test.fail("a comment reports itself")
+
+@test
+fn test_an_event_list_round_trips_through_the_reader() [io]
+    let events = [sseevent.event("add", "73857293"), sseevent.event("remove", "2153"),
+                  sseevent.with_id(sseevent.message("YHOO\n+2\n10"), "7"), sseevent.message("")]
+    var r = ssereader.reader(ssereader.default_limits())
+    var step = ssereader.feed_text(r, ssewriter.encode_all(events))
+    var got: [sseevent.SseEvent] = []
+    loop
+        match step.signal
+            Some(SseDispatch(e)) => list.push(got, e)
+            Some(_)              => test.fail("only events were written")
+            None                 =>
+                break
+        step = ssereader.take(step.reader)
+    test.assert(list.len(got) == 4)
+    for i in 0..4
+        let want = events[i]
+        let have = got[i]
+        test.assert(have.kind == want.kind)
+        test.assert(have.data == want.data)
+    let third = got[2]
+    let fourth = got[3]
+    test.assert(third.id == "7")
+    test.assert(fourth.id == "7")
