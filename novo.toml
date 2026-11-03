@@ -1,6 +1,6 @@
 [package]
 name        = "sse-nv"
-version     = "0.1.0"
+version     = "0.1.1"
 description = "The WHATWG text/event-stream format both ways: a decoder that is fed bytes and drained of events, encoders for a server writing them, and the reconnection rules as values — the last event id, the retry time, and the responses that mean stop for good.  No socket."
 license     = "Apache-2.0"
 
@@ -21,7 +21,7 @@ category    = "web"
 tags        = ["sse", "server-sent-events", "eventsource", "text-event-stream", "whatwg", "streaming", "sans-io", "web"]
 repository  = "https://github.com/novolang/sse-nv"
 maintainers = ["novo-lang"]
-novo        = ">= 0.13.0"
+novo        = ">= 0.23.0"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.
